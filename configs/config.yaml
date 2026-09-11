@@ -44,7 +44,7 @@ contracts:
 # ceiling).
 rise_fall:
   base_stake: 0.35
-  min_edge: 0.21
+  min_edge: 0.11
   min_calibration_samples: 500
   mc_simulations: 50000
   # See decision/rise_fall_decision_engine.py's "MULTIPLE-COMPARISONS
