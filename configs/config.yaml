@@ -20,15 +20,19 @@ contracts:
 
   # Rise/Fall candidate durations for the Monte Carlo duration selector
   # (pricing/monte_carlo_duration.py) to rank, spanning both ticks and
-  # minutes -- wired in via decision/rise_fall_decision_engine.py. These
-  # defaults are a starting point only and have NOT been cross-checked
-  # against a live `contracts_for` response yet (see
-  # pricing/duration_grid.py's filter_to_allowed(), built but not yet
-  # called from app/main.py) -- Deriv's real min/max duration per (symbol,
-  # contract_type) varies and can change server-side. Verify against a demo
-  # account before trusting these blindly in production.
+  # minutes -- wired in via decision/rise_fall_decision_engine.py.
+  # app/main.py now cross-checks this static grid against a live
+  # `contracts_for` response per symbol before trading with it (see
+  # pricing/duration_grid.py's filter_to_allowed()), so a value here that's
+  # invalid for a given symbol/contract_type gets dropped rather than
+  # spamming "Proposal request failed" on every tick. Even so, keep these
+  # defaults realistic: confirmed in production that Deriv rejects CALL/PUT
+  # tick-duration contracts outside 1-10 ticks ("Number of ticks must be
+  # between 1 and 10") -- the previous defaults included 15/20/30, which
+  # are minute-scale values that were never valid as tick counts and were
+  # rejected on every single evaluation for every symbol.
   rise_fall:
-    candidate_tick_durations: [5, 10, 15, 20, 30]
+    candidate_tick_durations: [3, 5, 7, 10]
     candidate_minute_durations: [1, 2, 3, 5, 10]
 
 # Rise/Fall trade sizing and gating (decision/rise_fall_decision_engine.py).
