@@ -31,6 +31,8 @@ from database.supabase_client import make_supabase_client
 from decision.rise_fall_decision_engine import RiseFallSymbolPipeline, summary_reason
 from execution.orders import OrderExecutor, intent_from_rise_fall_decision
 from ingestion.deriv_client import DerivClient
+from pricing.contracts import FALL, RISE
+from pricing.duration_grid import build_candidate_grid, filter_to_allowed
 from pricing.monte_carlo_duration import DEFAULT_MC_SIMULATIONS
 from risk.risk_engine import RiskEngine
 
@@ -54,6 +56,42 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
                                           default=[1, 2, 3, 5, 10])
 
     log = get_logger("app.symbol_worker", symbol=symbol)
+
+    # Cross-check the static config grid against Deriv's live per-symbol
+    # limits before trading with it -- pricing/duration_grid.py's
+    # filter_to_allowed() was built for exactly this but was never actually
+    # called anywhere, which is why an out-of-range static candidate (e.g.
+    # a tick duration above Deriv's CALL/PUT max of 10 ticks) was reaching
+    # get_quote() on every single tick and getting rejected with "Proposal
+    # request failed" / "Number of ticks must be between 1 and 10." forever,
+    # since nothing ever removed it from the grid. Filtered against BOTH
+    # RISE (CALL) and FALL (PUT) limits -- evaluate() shares one candidate
+    # list across both directions, so a duration has to be valid for both
+    # to be safe to hand it either one.
+    try:
+        contracts_for = await client.get_contracts_for(symbol)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("contracts_for lookup failed; trading with unfiltered candidate durations",
+                    extra={"extra_fields": {"error": str(exc)}})
+        contracts_for = None
+
+    if contracts_for:
+        candidate_grid = build_candidate_grid(tick_candidate_durations, minute_candidate_durations)
+        for contract_type in (RISE, FALL):
+            candidate_grid = filter_to_allowed(candidate_grid, contracts_for, contract_type)
+        filtered_ticks = sorted({c.duration for c in candidate_grid if c.duration_unit == "t"})
+        filtered_minutes = sorted({c.duration for c in candidate_grid if c.duration_unit == "m"})
+        dropped = (set(tick_candidate_durations) - set(filtered_ticks)) | \
+                  (set(minute_candidate_durations) - set(filtered_minutes))
+        if dropped:
+            log.warning("Dropped candidate durations outside Deriv's live limits", extra={"extra_fields": {
+                "dropped": sorted(dropped), "tick_candidates": filtered_ticks, "minute_candidates": filtered_minutes,
+            }})
+        tick_candidate_durations = filtered_ticks
+        minute_candidate_durations = filtered_minutes
+        if not tick_candidate_durations and not minute_candidate_durations:
+            log.error("No candidate durations survived contracts_for filtering -- this symbol cannot trade "
+                      "Rise/Fall until configs/config.yaml's rise_fall duration lists are corrected.")
     log.info("Worker started", extra={"extra_fields": {
         "base_stake": pipeline.base_stake, "min_edge": pipeline.min_edge,
         "tick_candidates": tick_candidate_durations, "minute_candidates": minute_candidate_durations,
