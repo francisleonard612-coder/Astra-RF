@@ -43,10 +43,10 @@ contracts:
 # allocator's independent sizing disagreed by 527x, caught only by a hard
 # ceiling).
 rise_fall:
-  base_stake: 1.0
-  min_edge: 0.03
-  min_calibration_samples: 200
-  mc_simulations: 5000
+  base_stake: 0.35
+  min_edge: 0.06
+  min_calibration_samples: 500
+  mc_simulations: 50000
   # See decision/rise_fall_decision_engine.py's "MULTIPLE-COMPARISONS
   # WARNING": evaluate() checks 4 candidates per cycle and takes the best
   # edge, which measurably inflates the false-positive rate above what
@@ -61,19 +61,19 @@ max_markov_order: 3
 min_samples_per_symbol: 300      # minimum digits observed before Astra will predict at all
 
 risk:
-  base_stake: 1.0
-  max_stake: 5.0
+  base_stake: 0.35
+  max_stake: 1.2
   max_consecutive_losses: 5
   max_daily_loss: 25.0
   max_drawdown: 40.0
-  max_trades_per_day: 500
+  max_trades_per_day: 5000
   max_concurrent_trades: 2         # hard cap on simultaneously OPEN (unsettled) contracts, across all symbols
   cooldown_seconds_after_max_losses: 900
   staking:
     enabled: false                 # LEGACY, digit-only (risk/staking.py) -- Rise/Fall uses rise_fall.base_stake
                                     # directly as a flat stake instead, see that section's own comment for why
-    progression_factor: 2.0
-    max_steps: 3
+    progression_factor: 1.18
+    max_steps: 4
 
 database:
   supabase_enabled: true
