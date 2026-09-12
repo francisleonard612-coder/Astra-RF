@@ -21,6 +21,7 @@ this build -- see app/logging_setup.py.
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 
 from app.config import get_config
@@ -34,6 +35,10 @@ from ingestion.deriv_client import DerivClient
 from pricing.contracts import FALL, RISE
 from pricing.duration_grid import build_candidate_grid, filter_to_allowed
 from pricing.monte_carlo_duration import DEFAULT_MC_SIMULATIONS
+from research.calibration_warmstart import (
+    apply_samples_to_pipeline, extract_samples_from_pipeline, jsonable_to_samples,
+    load_samples_json, samples_to_jsonable,
+)
 from risk.risk_engine import RiskEngine
 
 logger = get_logger("app.main")
@@ -50,6 +55,7 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
 
     rf_cfg = cfg.get("rise_fall", default={})
     n_sims = rf_cfg.get("mc_simulations", DEFAULT_MC_SIMULATIONS)
+    staking_cfg = rf_cfg.get("staking", {}) or {}
     tick_candidate_durations = cfg.get("contracts", "rise_fall", "candidate_tick_durations",
                                         default=[5, 10, 15, 20, 30])
     minute_candidate_durations = cfg.get("contracts", "rise_fall", "candidate_minute_durations",
@@ -166,9 +172,23 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
                 # Rise/Fall contract, can be minutes after this tick.
                 risk_engine.reserve_trade_slot()
 
-                def _on_settled(result, _log=log, _pipeline=pipeline, _summary=tick_summary):
+                def _on_settled(result, _log=log, _pipeline=pipeline, _summary=tick_summary,
+                                 _repo=repo, _symbol=symbol, _persist_staking=staking_cfg.get(
+                                     "persist_across_restarts", False)):
                     if result.won is not None:
                         _pipeline.record_outcome(result.won)
+                        # Persist calibration state after every real,
+                        # settled outcome -- not just at shutdown -- so a
+                        # crash between saves loses at most the trades
+                        # since the last settlement, not everything since
+                        # the process started. See database/repository.py's
+                        # save_rise_fall_calibration_state docstring and
+                        # app/main.py's startup restore logic above.
+                        _repo.save_rise_fall_calibration_state(
+                            _symbol, samples_to_jsonable(extract_samples_from_pipeline(_pipeline)))
+                        if _persist_staking:
+                            step, consecutive_losses = _pipeline.staking.get_state(_symbol)
+                            _repo.save_rise_fall_staking_state(_symbol, step, consecutive_losses)
                     else:
                         # settlement timed out / came back unknown -- no
                         # real outcome to record, but the pending slot
@@ -204,24 +224,29 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
             tick_summary.record_no_trade(summary_reason(decision))
 
         if tick_summary.due():
-            # Per-contract-type calibration diagnostics -- makes it visible
-            # from the logs alone whether a symbol's calibrator has actually
-            # engaged yet (is_calibrated) and, once it has, how reliable it
-            # is (quality_score's ECE-based 0..1 score -- see models/
-            # calibration.py). Without this, "mc_win_probability" and
-            # "calibrated_probability" being identical in an "Executing
-            # trade" log line is indistinguishable from a real, validated
-            # calibration passing raw probabilities straight through by
-            # coincidence -- this is the one place that ambiguity gets
-            # resolved.
+            # Per-(contract_type, resolution) calibration diagnostics --
+            # makes it visible from the logs alone whether a symbol's
+            # calibrator has actually engaged yet (is_calibrated) and, once
+            # it has, how reliable it is (quality_score's ECE-based 0..1
+            # score -- see models/calibration.py). Without this,
+            # "mc_win_probability" and "calibrated_probability" being
+            # identical in an "Executing trade" log line is
+            # indistinguishable from a real, validated calibration passing
+            # raw probabilities straight through by coincidence -- this is
+            # the one place that ambiguity gets resolved. Keyed as
+            # "CALL_t"/"CALL_m"/"PUT_t"/"PUT_m" (string, not tuple -- JSON
+            # object keys must be strings) since calibration is now split
+            # per resolution, not just per contract_type -- see
+            # decision/rise_fall_decision_engine.py's "PER-RESOLUTION
+            # CALIBRATION".
             calibration_stats = {
-                contract_type: {
-                    "n": pipeline.calibration[contract_type].sample_size,
-                    "is_calibrated": pipeline.calibration[contract_type].is_calibrated,
-                    "quality_score": round(pipeline.calibration[contract_type].quality_score(), 3),
-                    "rolling_log_loss": pipeline.calibration[contract_type].rolling_log_loss(),
+                f"{contract_type}_{unit}": {
+                    "n": pipeline.calibration[(contract_type, unit)].sample_size,
+                    "is_calibrated": pipeline.calibration[(contract_type, unit)].is_calibrated,
+                    "quality_score": round(pipeline.calibration[(contract_type, unit)].quality_score(), 3),
+                    "rolling_log_loss": pipeline.calibration[(contract_type, unit)].rolling_log_loss(),
                 }
-                for contract_type in (RISE, FALL)
+                for contract_type in (RISE, FALL) for unit in ("t", "m")
             }
             summary = tick_summary.build_and_reset("rise_fall", len(pipeline.price_series.prices),
                                                     calibration_stats)
@@ -313,6 +338,12 @@ async def main() -> None:
             # and calibrated_probability clear this threshold (see
             # decision/rise_fall_decision_engine.py's "CONFIDENCE GATE").
             min_confidence=rf_cfg.get("min_confidence", 0.70),
+            # Calibration-quality gate: once a candidate's calibrator has
+            # fit, its quality_score() must also clear this (see
+            # decision/rise_fall_decision_engine.py's "CALIBRATION-QUALITY
+            # GATE"). 0.0 disables it -- see that docstring for why this is
+            # off by default.
+            min_calibration_quality=rf_cfg.get("min_calibration_quality", 0.0),
             # Martingale staking -- opt-in, off by default (see
             # decision/rise_fall_decision_engine.py's "MARTINGALE STAKING"
             # and risk/staking.py's own documented warning).
@@ -322,6 +353,60 @@ async def main() -> None:
             staking_max_stake=staking_cfg.get("max_stake"),
             staking_min_consecutive_losses=staking_cfg.get("min_consecutive_losses", 2),
         )
+
+    # Restore calibration state, in priority order:
+    #   1. Supabase (astra_rise_fall_calibration_state) -- the bot's OWN
+    #      continuously-updated state from every previous settlement (see
+    #      _on_settled below, which saves here after every trade). This is
+    #      what actually survives a Railway restart/redeploy day to day.
+    #   2. The one-off file-based warm-start (calibration_warm_start_dir,
+    #      research/calibration_warmstart.py / backtest/warm_start_
+    #      calibration.py) -- only useful the very FIRST time, before
+    #      Supabase has anything for this symbol yet, to seed from history
+    #      that predates the bot ever running.
+    # Either is optional; a symbol with neither just starts cold, same as
+    # before either existed.
+    warm_start_dir = rf_cfg.get("calibration_warm_start_dir")
+    for symbol, pipeline in pipelines.items():
+        supabase_state = repo.load_rise_fall_calibration_state(symbol)
+        if supabase_state:
+            applied = apply_samples_to_pipeline(pipeline, jsonable_to_samples(supabase_state))
+            logger.info("Restored calibration state from Supabase",
+                        extra={"extra_fields": {"symbol": symbol, "applied": applied}})
+            continue  # Supabase state found -- the file-based warm-start would be redundant/stale on top of it
+        if not warm_start_dir:
+            continue
+        path = os.path.join(warm_start_dir, f"{symbol}.json")
+        if not os.path.exists(path):
+            logger.info("No calibration state in Supabase or warm-start file for symbol",
+                        extra={"extra_fields": {"symbol": symbol, "path": path}})
+            continue
+        try:
+            samples = load_samples_json(path)
+            applied = apply_samples_to_pipeline(pipeline, samples)
+            logger.info("Loaded calibration warm-start from file",
+                        extra={"extra_fields": {"symbol": symbol, "path": path, "applied": applied}})
+        except Exception as exc:  # noqa: BLE001 -- a bad/missing warm-start file must never block startup
+            logger.warning("Calibration warm-start load failed",
+                            extra={"extra_fields": {"symbol": symbol, "path": path, "error": str(exc)}})
+
+    # Martingale progression state -- NOT restored by default even when
+    # martingale itself is enabled. See risk/staking.py's StakingEngine
+    # docstring and configs/config.yaml's rise_fall.staking.
+    # persist_across_restarts for why this is a deliberate opt-in, not an
+    # obvious win the way calibration restore above is.
+    if staking_cfg.get("persist_across_restarts", False):
+        for symbol, pipeline in pipelines.items():
+            staking_state = repo.load_rise_fall_staking_state(symbol)
+            if staking_state:
+                pipeline.staking.load_state(
+                    symbol, step=staking_state.get("step", 0),
+                    consecutive_losses=staking_state.get("consecutive_losses", 0),
+                )
+                logger.info("Restored staking state from Supabase", extra={"extra_fields": {
+                    "symbol": symbol, "step": staking_state.get("step", 0),
+                    "consecutive_losses": staking_state.get("consecutive_losses", 0),
+                }})
 
     seed_tasks = [seed_symbol(client, p) for p in pipelines.values()]
     await asyncio.gather(*seed_tasks)

@@ -138,9 +138,18 @@ class AstraConfig:
         self.raw.setdefault("rise_fall", {})
         self.raw["rise_fall"]["min_confidence"] = _env_float(
             "RISE_FALL_MIN_CONFIDENCE", rf_yaml.get("min_confidence", 0.70))
+        self.raw["rise_fall"]["min_calibration_quality"] = _env_float(
+            "RISE_FALL_MIN_CALIBRATION_QUALITY", rf_yaml.get("min_calibration_quality", 0.0))
+        _env_warm_start_dir = os.getenv("RISE_FALL_CALIBRATION_WARM_START_DIR")
+        self.raw["rise_fall"]["calibration_warm_start_dir"] = (
+            _env_warm_start_dir if _env_warm_start_dir not in (None, "")
+            else rf_yaml.get("calibration_warm_start_dir")
+        )
         self.raw["rise_fall"].setdefault("staking", {})
         self.raw["rise_fall"]["staking"]["enabled"] = _env_bool(
             "RISE_FALL_MARTINGALE_ENABLED", staking_yaml.get("enabled", False))
+        self.raw["rise_fall"]["staking"]["persist_across_restarts"] = _env_bool(
+            "RISE_FALL_MARTINGALE_PERSIST_ACROSS_RESTARTS", staking_yaml.get("persist_across_restarts", False))
         self.raw["rise_fall"]["staking"]["progression_factor"] = _env_float(
             "RISE_FALL_MARTINGALE_FACTOR", staking_yaml.get("progression_factor", 2.0))
         self.raw["rise_fall"]["staking"]["min_consecutive_losses"] = _env_int(
