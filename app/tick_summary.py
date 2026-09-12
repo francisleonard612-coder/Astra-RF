@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _ARCH_PREFIX_RE = re.compile(r"^\[(global|specialist|hybrid)\]\s*")
 
@@ -40,6 +40,17 @@ class TickSummary:
     top_no_trade_reasons: dict[str, int]
     champion_architecture: str
     sample_size: int
+    # Per-contract-type calibration diagnostics -- see
+    # models/calibration.py's CalibrationTracker.quality_score()/
+    # sample_size/rolling_log_loss(). Empty dict for any caller that doesn't
+    # pass calibration_stats to build_and_reset() (keeps this backward
+    # compatible with callers/tests that don't track calibration at all).
+    # Without this, a stated mc_win_probability/calibrated_probability could
+    # look identical in the "Executing trade" log whether the calibrator has
+    # 5 samples and is still passing raw probabilities straight through, or
+    # has 5,000 samples and a well-fit isotonic curve behind it -- there was
+    # previously no way to tell those two situations apart from the logs.
+    calibration: dict[str, dict] = field(default_factory=dict)
 
 
 class TickSummaryTracker:
@@ -81,7 +92,8 @@ class TickSummaryTracker:
     def due(self) -> bool:
         return self.ticks >= self.window_size
 
-    def build_and_reset(self, champion_architecture: str, sample_size: int) -> TickSummary:
+    def build_and_reset(self, champion_architecture: str, sample_size: int,
+                         calibration_stats: dict[str, dict] | None = None) -> TickSummary:
         summary = TickSummary(
             window_ticks=self.ticks,
             trades_executed=self.trades,
@@ -92,6 +104,7 @@ class TickSummaryTracker:
             top_no_trade_reasons=dict(self.no_trade_reasons.most_common(5)),
             champion_architecture=champion_architecture,
             sample_size=sample_size,
+            calibration=calibration_stats or {},
         )
         self._reset()
         return summary
