@@ -269,4 +269,10 @@ class OrderExecutor:
         if pending:
             logger.warning("Some settlement watchers did not finish before shutdown", extra={"extra_fields": {
                 "abandoned": len(pending),
-            }})
+         if on_settled is not None:
+             try:
+                on_settled(result)
+             except Exception as exc:  # noqa: BLE001
+                 logger.error("on_settled callback failed", exc_info=exc, extra={"extra_fields": {
+                     "symbol": intent.symbol, "error": str(exc),
+                 }})
