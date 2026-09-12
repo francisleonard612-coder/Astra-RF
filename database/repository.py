@@ -191,6 +191,37 @@ class Repository:
             return result.data[0]
         return None
 
+    def save_rise_fall_calibration_state(self, symbol: str, calibration: dict) -> None:
+        """calibration: the jsonable form from research/calibration_warmstart.py's
+        samples_to_jsonable() -- {"CALL_t": {"raw": [...], "outcome": [...]}, ...}.
+        Called after every settlement (see app/main.py's _on_settled), not
+        just at shutdown -- a crash between saves loses at most the trades
+        since the last settlement, not everything since the process started."""
+        row = _json_safe({"symbol": symbol, "calibration": calibration, "updated_at": "now()"})
+        self._safe(lambda: self.client.table("astra_rise_fall_calibration_state").upsert(row).execute())
+
+    def load_rise_fall_calibration_state(self, symbol: str) -> dict | None:
+        result = self._safe(
+            lambda: self.client.table("astra_rise_fall_calibration_state").select("*").eq("symbol", symbol).execute()
+        )
+        if result and result.data:
+            return result.data[0].get("calibration")
+        return None
+
+    def save_rise_fall_staking_state(self, symbol: str, step: int, consecutive_losses: int) -> None:
+        row = _json_safe({
+            "symbol": symbol, "step": step, "consecutive_losses": consecutive_losses, "updated_at": "now()",
+        })
+        self._safe(lambda: self.client.table("astra_rise_fall_staking_state").upsert(row).execute())
+
+    def load_rise_fall_staking_state(self, symbol: str) -> dict[str, Any] | None:
+        result = self._safe(
+            lambda: self.client.table("astra_rise_fall_staking_state").select("*").eq("symbol", symbol).execute()
+        )
+        if result and result.data:
+            return result.data[0]
+        return None
+
     def prune_old_ticks(self, retention_hours: int) -> None:
         cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - retention_hours * 3600))
         self._safe(lambda: self.client.table("astra_ticks").delete().lt("created_at", cutoff).execute())
