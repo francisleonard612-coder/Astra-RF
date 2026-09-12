@@ -125,6 +125,33 @@ class AstraConfig:
         self.raw["risk"]["staking"]["progression_factor"] = self.risk_overrides.martingale_factor
         self.raw["risk"]["staking"]["max_steps"] = self.risk_overrides.martingale_max_steps
 
+        # Rise/Fall's own confidence gate + martingale config (separate from
+        # the LEGACY digit-only risk.staking block above -- see
+        # decision/rise_fall_decision_engine.py's "CONFIDENCE GATE" and
+        # "MARTINGALE STAKING" docstrings). Unlike the block above, these
+        # env overrides fall back to whatever configs/config.yaml already
+        # has (not a hardcoded default) when the env var is unset, so
+        # editing the YAML file directly still works without also having to
+        # set an env var.
+        rf_yaml = self.raw.get("rise_fall", {}) or {}
+        staking_yaml = rf_yaml.get("staking", {}) or {}
+        self.raw.setdefault("rise_fall", {})
+        self.raw["rise_fall"]["min_confidence"] = _env_float(
+            "RISE_FALL_MIN_CONFIDENCE", rf_yaml.get("min_confidence", 0.70))
+        self.raw["rise_fall"].setdefault("staking", {})
+        self.raw["rise_fall"]["staking"]["enabled"] = _env_bool(
+            "RISE_FALL_MARTINGALE_ENABLED", staking_yaml.get("enabled", False))
+        self.raw["rise_fall"]["staking"]["progression_factor"] = _env_float(
+            "RISE_FALL_MARTINGALE_FACTOR", staking_yaml.get("progression_factor", 2.0))
+        self.raw["rise_fall"]["staking"]["min_consecutive_losses"] = _env_int(
+            "RISE_FALL_MARTINGALE_MIN_CONSECUTIVE_LOSSES", staking_yaml.get("min_consecutive_losses", 2))
+        self.raw["rise_fall"]["staking"]["max_steps"] = _env_int(
+            "RISE_FALL_MARTINGALE_MAX_STEPS", staking_yaml.get("max_steps", 4))
+        _env_max_stake = os.getenv("RISE_FALL_MARTINGALE_MAX_STAKE")
+        self.raw["rise_fall"]["staking"]["max_stake"] = (
+            float(_env_max_stake) if _env_max_stake not in (None, "") else staking_yaml.get("max_stake")
+        )
+
         # See DerivConfig.use_real_account docstring above for how this
         # combines with account type to give four distinct modes.
         self.dry_run: bool = _env_bool("DRY_RUN", False)

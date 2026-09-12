@@ -94,6 +94,8 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
                       "Rise/Fall until configs/config.yaml's rise_fall duration lists are corrected.")
     log.info("Worker started", extra={"extra_fields": {
         "base_stake": pipeline.base_stake, "min_edge": pipeline.min_edge,
+        "min_confidence": pipeline.min_confidence,
+        "staking_enabled": pipeline.staking.enabled,
         "tick_candidates": tick_candidate_durations, "minute_candidates": minute_candidate_durations,
         "seeded_prices": len(pipeline.price_series.prices),
     }})
@@ -119,11 +121,21 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
         if tick_count % EVALUATE_EVERY_N_TICKS != 0:
             continue
 
-        risk_ok, risk_reason = risk_engine.check(pipeline.base_stake)
-
         decision = await pipeline.evaluate(
             client, currency, tick_candidate_durations, minute_candidate_durations, n_sims=n_sims,
         )
+
+        # Gate against the ACTUAL stake this decision would trade at (after
+        # martingale escalation/reset and any drift-degraded reduction),
+        # never a pre-evaluate estimate -- decision.stake is only known
+        # once evaluate() has run. Checking an earlier proxy (e.g. a flat
+        # pipeline.base_stake) against risk.max_stake would silently let a
+        # martingale-escalated stake through uninspected, which is exactly
+        # the class of stake-mismatch bug decision/rise_fall_decision_
+        # engine.py's own "STAKE SIZING WARNING" documents a real prior
+        # incident about. No stake to check at all on a NO_TRADE decision.
+        risk_ok, risk_reason = (True, None) if decision.decision == "NO_TRADE" \
+            else risk_engine.check(decision.stake)
 
         if decision.decision != "NO_TRADE" and risk_ok:
             log.info("Executing trade", extra={"extra_fields": {
@@ -270,12 +282,25 @@ async def main() -> None:
     order_executor = OrderExecutor(client, repo, risk_engine, dry_run=cfg.dry_run)
 
     rf_cfg = cfg.get("rise_fall", default={})
+    staking_cfg = rf_cfg.get("staking", {}) or {}
     pipelines = {}
     for symbol in symbols:
         repo.upsert_symbol(symbol)
         pipelines[symbol] = RiseFallSymbolPipeline(
             symbol, base_stake=rf_cfg.get("base_stake", 1.0), min_edge=rf_cfg.get("min_edge", 0.03),
             min_calibration_samples=rf_cfg.get("min_calibration_samples", 200),
+            # Confidence gate: only allow entries when BOTH mc_win_probability
+            # and calibrated_probability clear this threshold (see
+            # decision/rise_fall_decision_engine.py's "CONFIDENCE GATE").
+            min_confidence=rf_cfg.get("min_confidence", 0.70),
+            # Martingale staking -- opt-in, off by default (see
+            # decision/rise_fall_decision_engine.py's "MARTINGALE STAKING"
+            # and risk/staking.py's own documented warning).
+            staking_enabled=staking_cfg.get("enabled", False),
+            staking_progression_factor=staking_cfg.get("progression_factor", 2.0),
+            staking_max_steps=staking_cfg.get("max_steps", 4),
+            staking_max_stake=staking_cfg.get("max_stake"),
+            staking_min_consecutive_losses=staking_cfg.get("min_consecutive_losses", 2),
         )
 
     seed_tasks = [seed_symbol(client, p) for p in pipelines.values()]
