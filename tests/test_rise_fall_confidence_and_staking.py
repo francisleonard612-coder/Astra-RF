@@ -341,3 +341,74 @@ def test_staking_engine_explicit_threshold_of_two_matches_rise_fall_default():
     assert staking.current_stake("R_100") == 1.0
     staking.record_result("R_100", won=False)  # back to loss #1 of a fresh streak
     assert staking.current_stake("R_100") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Stake decimal-precision regression (found from a live deployment log:
+# base_stake=0.35, progression_factor=1.18 -- carried over from this
+# account's own LEGACY digit-staking config -- gave 0.35*1.18=0.413 at
+# step=1, which Deriv's proposal endpoint rejects with "Stake can not have
+# more than 2 decimal places." Confirmed from the log that this silently and
+# PERMANENTLY froze the affected symbol's Rise/Fall trading for the rest of
+# the run, since a rejected quote means no decision, which means
+# record_outcome() never fires to move the stuck progression off that stake.
+# ---------------------------------------------------------------------------
+
+def test_staking_current_stake_never_exceeds_two_decimal_places():
+    """The exact production scenario: base_stake=0.35, progression_factor=
+    1.18 (copied from the legacy digit config) used to produce 0.413 at
+    step=1 -- more than 2 decimal places, and Deriv's proposal endpoint
+    rejects that outright."""
+    from risk.staking import StakingEngine
+    staking = StakingEngine(base_stake=0.35, enabled=True, progression_factor=1.18,
+                             max_steps=4, max_stake=5.0, min_consecutive_losses_before_escalation=1)
+    for _ in range(6):
+        stake = staking.current_stake("R_100")
+        assert round(stake, 2) == stake, f"{stake!r} has more than 2 decimal places"
+        staking.record_result("R_100", won=False)
+
+
+def test_staking_current_stake_rounds_regardless_of_progression_factor():
+    """Sweeps a range of progression factors that are NOT clean powers of
+    2 -- the class of factor most likely to produce a >2-decimal-place
+    stake -- confirming the rounding fix holds generally, not just for the
+    one factor seen in production."""
+    from risk.staking import StakingEngine
+    for factor in (1.05, 1.1, 1.18, 1.3, 1.5, 1.7, 2.3, 3.0):
+        staking = StakingEngine(base_stake=0.35, enabled=True, progression_factor=factor,
+                                 max_steps=5, max_stake=50.0, min_consecutive_losses_before_escalation=1)
+        for _ in range(8):
+            stake = staking.current_stake("R_100")
+            assert round(stake, 2) == stake, f"factor={factor}: {stake!r} has more than 2 decimal places"
+            staking.record_result("R_100", won=False)
+
+
+def test_staking_current_stake_rounds_when_disabled_too():
+    from risk.staking import StakingEngine
+    staking = StakingEngine(base_stake=0.413, enabled=False, progression_factor=2.0,
+                             max_steps=4, max_stake=5.0)
+    assert staking.current_stake("R_100") == 0.41
+
+
+def test_evaluate_never_produces_a_stake_with_more_than_two_decimal_places():
+    """End-to-end version of the regression above, through the actual
+    evaluate() code path with the exact production progression_factor."""
+    _reset_payout_module_state()
+
+    async def run():
+        pipeline = RiseFallSymbolPipeline(
+            "1HZ10V", base_stake=0.35, min_edge=0.03,
+            staking_enabled=True, staking_progression_factor=1.18,
+            staking_max_steps=4, staking_max_stake=5.0, staking_min_consecutive_losses=1,
+        )
+        client = FakeDerivClient({RISE: 1.5, FALL: 50.0})
+        _seed_trending_history(pipeline, seed=0, drift=-0.01)
+
+        for _ in range(5):
+            decision = await pipeline.evaluate(client, "USD", [5, 10], [1, 3], n_sims=2000,
+                                                rng=np.random.default_rng(0))
+            assert decision.decision != "NO_TRADE"
+            assert round(decision.stake, 2) == decision.stake
+            pipeline.record_outcome(won=False)
+
+    asyncio.run(run())

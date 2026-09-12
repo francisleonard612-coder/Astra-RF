@@ -77,3 +77,24 @@ def test_trade_with_unknown_outcome_still_counts_as_a_trade_attempt():
     assert summary.wins == 0
     assert summary.losses == 0
     assert summary.pnl == 0.0
+
+
+def test_calibration_stats_default_to_empty_dict_when_not_provided():
+    """Callers that don't track calibration (or haven't been updated to
+    pass it) must keep working exactly as before -- this field is additive,
+    not a new required argument."""
+    tracker = TickSummaryTracker(window_size=1)
+    tracker.record_no_trade("insufficient_sample_size")
+    summary = tracker.build_and_reset("global", 500)
+    assert summary.calibration == {}
+
+
+def test_calibration_stats_are_carried_through_when_provided():
+    tracker = TickSummaryTracker(window_size=1)
+    tracker.record_no_trade("insufficient_sample_size")
+    stats = {
+        "CALL": {"n": 12, "is_calibrated": False, "quality_score": 0.3, "rolling_log_loss": 0.69},
+        "PUT": {"n": 512, "is_calibrated": True, "quality_score": 0.87, "rolling_log_loss": 0.41},
+    }
+    summary = tracker.build_and_reset("rise_fall", 1000, calibration_stats=stats)
+    assert summary.calibration == stats
