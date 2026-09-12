@@ -25,12 +25,22 @@ class StakingState:
 
 class StakingEngine:
     def __init__(self, base_stake: float, enabled: bool, progression_factor: float,
-                 max_steps: int, max_stake: float):
+                 max_steps: int, max_stake: float, min_consecutive_losses_before_escalation: int = 1):
         self.base_stake = base_stake
         self.enabled = enabled
         self.progression_factor = progression_factor
         self.max_steps = max_steps
         self.max_stake = max_stake
+        # How many consecutive losses must accumulate before the FIRST
+        # escalation happens. Default 1 preserves the original behavior
+        # (escalate immediately after a single loss). A caller can raise
+        # this -- e.g. Astra's Rise/Fall pipeline uses 2, so one isolated
+        # loss alone doesn't move the stake at all, and the progression only
+        # engages once a second loss follows it consecutively. This does
+        # NOT change what happens once escalation has started: every loss
+        # after the threshold still steps up by progression_factor, same as
+        # before.
+        self.min_consecutive_losses_before_escalation = max(1, min_consecutive_losses_before_escalation)
         self._state: dict[str, StakingState] = {}
 
     def _get(self, symbol: str) -> StakingState:
@@ -48,9 +58,16 @@ class StakingEngine:
         if won:
             state.step = 0
             state.consecutive_losses = 0
+            return
+        state.consecutive_losses += 1
+        if not self.enabled:
+            return
+        if state.consecutive_losses < self.min_consecutive_losses_before_escalation:
+            # Not enough consecutive losses yet to engage the progression --
+            # stake stays exactly where it is (base_stake, if this is the
+            # very first loss in a fresh streak).
+            return
+        if state.step < self.max_steps:
+            state.step += 1
         else:
-            state.consecutive_losses += 1
-            if self.enabled and state.step < self.max_steps:
-                state.step += 1
-            elif self.enabled:
-                state.step = 0  # reset after max steps -- never climb forever
+            state.step = 0  # reset after max steps -- never climb forever
