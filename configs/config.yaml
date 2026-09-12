@@ -63,6 +63,30 @@ rise_fall:
   # GATE" docstring for why both are required.
   min_confidence: 0.70
 
+  # CALIBRATION-QUALITY GATE: found from a live deployment log where every
+  # "Executing trade" line showed mc_win_probability == calibrated_
+  # probability bit for bit -- calibration hadn't collected enough samples
+  # to ever fit, so min_confidence above was comparing the same number to
+  # itself twice. Once a candidate's calibrator HAS fit (is_calibrated=
+  # True), this additionally requires its quality_score() (models/
+  # calibration.py's ECE-based 0..1 reliability score) to clear this value
+  # -- never enforced before a calibrator has fit, so it doesn't block
+  # trading during a fresh symbol's cold start. 0.0 disables this gate (the
+  # default) -- once tick_summary's calibration diagnostics show real
+  # quality scores for a symbol, a sensible non-zero value to try is ~0.5.
+  # See decision/rise_fall_decision_engine.py's "CALIBRATION-QUALITY GATE".
+  min_calibration_quality: 0.0
+
+  # CALIBRATION WARM-START: if set, app/main.py loads
+  # {this_dir}/{symbol}.json at startup (produced by
+  # `python -m backtest.warm_start_calibration --symbols ...`) and replays
+  # its (raw_prob, outcome) pairs into the matching per-(contract_type,
+  # resolution) CalibrationTracker before the live loop starts, instead of
+  # every calibrator beginning cold. null (the default) skips this
+  # entirely -- see decision/rise_fall_decision_engine.py's "CALIBRATION
+  # WARM-START" and research/calibration_warmstart.py.
+  calibration_warm_start_dir: null
+
   # Martingale staking for Rise/Fall, routed through risk/staking.py's
   # StakingEngine (self.staking on RiseFallSymbolPipeline). OFF by default,
   # deliberately, same reasoning as risk.staking below: a sibling bot ran
@@ -75,6 +99,16 @@ rise_fall:
   # against the actual decision.stake for every trade.
   staking:
     enabled: false
+    # Whether martingale progression (step, consecutive_losses) survives a
+    # Railway restart/redeploy, via astra_rise_fall_staking_state in
+    # Supabase. Deliberately OFF even when staking.enabled is true: a
+    # restart currently resets an escalated stake back to base_stake,
+    # which can be read either as lost progression (a reason to persist)
+    # or as an accidental safety net against an escalated stake surviving
+    # an unplanned restart (a reason not to). Calibration state (below,
+    # under min_calibration_quality) has no such tradeoff and is always
+    # persisted regardless of this flag.
+    persist_across_restarts: false
     progression_factor: 2.0   # classic martingale: double the stake after each loss
     min_consecutive_losses: 2  # progression only ENGAGES after this many consecutive
                                 # losses -- one isolated loss alone leaves stake at
@@ -82,6 +116,7 @@ rise_fall:
                                 # escalates it. Set to 1 to escalate after every loss.
     max_steps: 4               # resets to base_stake after this many consecutive escalations
     max_stake: 5.0              # hard ceiling on the progression itself, independent of risk.max_stake
+
 
 feature_windows: [20, 50, 100, 250, 500, 1000, 2500]
 max_markov_order: 3
