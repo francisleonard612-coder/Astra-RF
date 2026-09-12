@@ -2,23 +2,24 @@
 Rise/Fall decision engine core.
 
 Pipeline, per evaluation:
-  1. PriceSeries (tick + minute log-returns) -> Hurst + vol-vs-baseline
-     (regime/hurst_volatility.py) -> classify_regime()
-     (decision/regime_conviction.py). RANGE_VOLATILE/NEUTRAL are skipped --
-     "chop, no edge" and "no regime, no justified layer set" are legitimate
-     reasons to sit out, independent of anything downstream.
-  2. Monte Carlo win-probability per (direction, duration-unit), via
-     monte_carlo_duration() -- tick and minute returns scanned SEPARATELY,
-     never pooled (see that module's docstring for why).
-  3. Each MC probability is calibrated through a per-symbol/side
-     CalibrationTracker before being treated as a true probability.
-  4. Real Deriv quote + compute_edge() (pricing/edge.py, unmodified --
-     already fully generic) -- mispricing against Deriv's ACTUAL payout is
-     the trade gate, not the raw MC/calibrated probability alone.
-  5. DriftDetector.check_all() -- degraded halves stake (matching the
-     source's own DRIFT_STAKE_REDUCTION=0.50 response: a caution signal,
-     not a hard block, consistent with how mild a single drift fire is
-     treated everywhere else in the ported material).
+
+1. PriceSeries (tick + minute log-returns) -> Hurst + vol-vs-baseline
+   (regime/hurst_volatility.py) -> classify_regime()
+   (decision/regime_conviction.py). RANGE_VOLATILE/NEUTRAL are skipped --
+   "chop, no edge" and "no regime, no justified layer set" are legitimate
+   reasons to sit out, independent of anything downstream.
+2. Monte Carlo win-probability per (direction, duration-unit), via
+   monte_carlo_duration() -- tick and minute returns scanned SEPARATELY,
+   never pooled (see that module's docstring for why).
+3. Each MC probability is calibrated through a per-symbol/side
+   CalibrationTracker before being treated as a true probability.
+4. Real Deriv quote + compute_edge() (pricing/edge.py, unmodified --
+   already fully generic) -- mispricing against Deriv's ACTUAL payout is
+   the trade gate, not the raw MC/calibrated probability alone.
+5. DriftDetector.check_all() -- degraded halves stake (matching the
+   source's own DRIFT_STAKE_REDUCTION=0.50 response: a caution signal,
+   not a hard block, consistent with how mild a single drift fire is
+   treated everywhere else in the ported material).
 
 Deliberately NOT wired in here: decision/regime_conviction.py's
 regime_votes()/compute_conviction() multi-layer voting and conviction
@@ -65,48 +66,26 @@ be more conservative here than they would for evaluating a single candidate
 in isolation, and this should be re-measured against real (not synthetic)
 return data before trusting a specific min_edge value in production.
 
-CONFIDENCE GATE (min_confidence, default 0.70): a second, independent gate
-alongside min_edge. min_edge alone accepts a candidate whenever the
-calibrated probability clears Deriv's breakeven probability by min_edge --
-which, at a generously-priced quote, can fire at a fairly low absolute
-probability (e.g. calibrated_p=0.55 against a breakeven of 0.45 clears
-min_edge=0.06 easily). This gate additionally requires BOTH the raw MC
-win-probability estimate (mc_win_probability) AND the calibrated
-probability to independently exceed min_confidence before a candidate is
-even considered -- checked before the real quote fetch, so a candidate that
-fails it never spends an API call. Requiring both (not just the calibrated
-one) means a candidate can't pass on calibration alone if the underlying MC
-simulation itself was unconvincing, and vice versa. This does not replace
-min_edge -- a candidate must still clear both gates.
+CONFIDENCE GATE: a candidate only clears this stage if BOTH its raw MC
+win-probability and its calibrated probability clear min_confidence. Both
+are already "probability of this contract_type's own favorable direction"
+(RISE's raw_prob is P(price up), FALL's is P(price down) -- see
+record_outcome()'s docstring), so no direction flip is needed for FALL.
+Found from a live deployment log where every "Executing trade" line showed
+mc_win_probability == calibrated_probability bit for bit -- calibration
+hadn't collected enough samples to ever fit, so this gate was comparing the
+same number to itself twice with no calibrator involved at all.
 
-MARTINGALE STAKING (opt-in, off by default): stake sizing can be routed
-through risk/staking.py's StakingEngine (self.staking) instead of always
-trading base_stake flat. See that module's own docstring for the
-documented reason this is opt-in, not default, elsewhere in this account.
-When enabled, self.staking.current_stake(symbol) replaces base_stake as the
-starting point for a trade's stake. The progression does NOT engage after a
-single isolated loss: it only starts escalating once a SECOND consecutive
-loss follows the first (staking_min_consecutive_losses=2 by default here --
-see StakingEngine's min_consecutive_losses_before_escalation), and from
-there escalates by progression_factor on each further consecutive loss
-(capped at staking_max_steps escalations and staking_max_stake in absolute
-terms), resetting to base_stake on any win. record_outcome() feeds it the
-same settled won/lost outcome used for calibration. Critically, this means
-the comparison quote fetched per candidate (at base_stake, purely to
-compute a stake-invariant edge) can no longer be assumed to match the
-actual trade's stake once staking has moved away from base_stake -- exactly
-the same "quote basis must match decision.stake" hazard the drift-reduction
-path below was already written to avoid, so the final-quote re-fetch
-condition now checks for either cause, not just drift degradation. As with
-the STAKE SIZING WARNING above: this progression multiplies base_stake, it
-never reads account balance, so it can't reproduce that specific incident --
-but it can absolutely still lose money faster than flat staking if the
-underlying edge doesn't hold, per risk/staking.py's own live-trade evidence
-from a sibling bot. The risk engine's max_stake remains the final,
-independent backstop regardless of what this progression computes (see
-app/main.py, which now checks risk_engine against decision.stake -- the
-actual post-staking, post-drift-reduction amount -- rather than a
-pre-evaluate estimate).
+CALIBRATION-QUALITY GATE: once a candidate's calibrator HAS fit
+(CalibrationTracker.is_calibrated == True), this additionally requires its
+quality_score() (an ECE-based 0..1 reliability score) to clear
+min_calibration_quality. Never enforced before a calibrator has fit, so it
+doesn't block trading during a fresh symbol's cold start. 0.0 (the default)
+disables this gate entirely.
+
+MARTINGALE STAKING: routed through risk/staking.py's StakingEngine
+(self.staking on RiseFallSymbolPipeline). OFF by default -- see that
+module's own documented incident from a sibling bot before enabling it.
 """
 from __future__ import annotations
 
@@ -121,11 +100,10 @@ from pricing.contracts import FALL, RISE
 from pricing.edge import compute_edge
 from pricing.monte_carlo_duration import DEFAULT_MC_SIMULATIONS, monte_carlo_duration
 from pricing.payout import ContractQuote, get_quote
-from risk.staking import StakingEngine
 from state.price_series import PriceSeries
-
 from decision.regime_conviction import TRADEABLE_REGIMES, classify_regime
 from regime.hurst_volatility import hurst_rs, realized_vol_and_baseline
+from risk.staking import StakingEngine
 
 DRIFT_STAKE_REDUCTION = 0.50  # matches the source's own response to a degraded DriftDetector
 
@@ -160,8 +138,10 @@ def summary_reason(decision: RiseFallDecision) -> str:
         return f"regime:{decision.regime}"
     if "still awaiting settlement" in decision.reason:
         return "pending_settlement"
-    if "no candidate cleared min_confidence" in decision.reason:
+    if "below confidence gate" in decision.reason:
         return "insufficient_confidence"
+    if "below calibration quality gate" in decision.reason:
+        return "poor_calibration_quality"
     if "no candidate cleared min_edge" in decision.reason:
         return "insufficient_edge"
     return "unknown"
@@ -171,38 +151,40 @@ class RiseFallSymbolPipeline:
     def __init__(self, symbol: str, base_stake: float = 1.0,
                  min_edge: float = 0.03, min_calibration_samples: int = 200,
                  min_confidence: float = 0.70,
-                 staking_enabled: bool = False, staking_progression_factor: float = 2.0,
-                 staking_max_steps: int = 4, staking_max_stake: float | None = None,
+                 min_calibration_quality: float = 0.0,
+                 staking_enabled: bool = False,
+                 staking_progression_factor: float = 2.0,
+                 staking_max_steps: int = 4,
+                 staking_max_stake: float | None = None,
                  staking_min_consecutive_losses: int = 2):
         self.symbol = symbol
         self.base_stake = base_stake
         self.min_edge = min_edge
-        # Confidence gate: a candidate must clear BOTH its raw MC
-        # win-probability estimate and its calibrated probability -- see
-        # this module's "CONFIDENCE GATE" docstring above.
         self.min_confidence = min_confidence
+        self.min_calibration_quality = min_calibration_quality
         self.price_series = PriceSeries(symbol=symbol)
         self.calibration: dict[str, CalibrationTracker] = {
             RISE: CalibrationTracker(min_samples=min_calibration_samples),
             FALL: CalibrationTracker(min_samples=min_calibration_samples),
         }
         self.drift = DriftDetector()
-        # Opt-in martingale staking -- see this module's "MARTINGALE
-        # STAKING" docstring above and risk/staking.py's own warning.
-        # Defaults to disabled (flat base_stake), matching Astra's
-        # established default-off posture for progression staking.
+
+        # staking_max_stake=None (the default whenever the config doesn't
+        # set rise_fall.staking.max_stake) falls back to the stake the
+        # configured progression would reach naturally at staking_max_steps,
+        # so StakingEngine always gets a real numeric ceiling instead of
+        # None (which would break its `min(stake, max_stake)` comparison).
+        resolved_max_stake = (
+            staking_max_stake if staking_max_stake is not None
+            else round(base_stake * (staking_progression_factor ** staking_max_steps), 2)
+        )
         self.staking = StakingEngine(
-            base_stake=base_stake,
-            enabled=staking_enabled,
+            base_stake=base_stake, enabled=staking_enabled,
             progression_factor=staking_progression_factor,
-            max_steps=staking_max_steps,
-            max_stake=(staking_max_stake if staking_max_stake is not None
-                       else base_stake * (staking_progression_factor ** staking_max_steps)),
-            # A single isolated loss does NOT escalate the stake -- the
-            # progression only engages once a second loss follows
-            # consecutively. See risk/staking.py's StakingEngine docstring.
+            max_steps=staking_max_steps, max_stake=resolved_max_stake,
             min_consecutive_losses_before_escalation=staking_min_consecutive_losses,
         )
+
         # Tracks ONLY the single candidate actually traded this cycle, not
         # every candidate evaluate() considered. "Did price go up" is
         # specific to a (duration, duration_unit) window -- price can rise
@@ -238,47 +220,37 @@ class RiseFallSymbolPipeline:
         OWN favorable direction -- RISE's raw_prob is P(price up), FALL's is
         P(price down) -- so `won` directly answers "did the event raw_prob
         was a probability of actually happen" for whichever side was
-        traded, with no flip required. (An earlier version of this method
-        flipped the outcome for FALL specifically, reasoning from "did price
-        go up" as a shared fact -- wrong, and caught by
-        test_record_outcome_calibrates_only_the_traded_candidate_fall:
-        FALL's raw_prob was never a probability of price going up in the
-        first place, so there was nothing to flip.)
+        traded, with no flip required.
 
         No separate entry/exit spot lookup needed either: for a standard
         (non-equals) Rise/Fall contract on a continuous-price synthetic
         index, an exact tie has effectively zero probability, so `won`
         alone fully determines which direction the price actually moved.
 
-        Also feeds the CUSUM drift check on the same outcome.
+        Also feeds the CUSUM drift check on the same outcome, and the
+        martingale StakingEngine (if enabled) so a loss can escalate the
+        next stake and a win can reset it.
         """
         if self._pending is not None:
             contract_type, raw_prob = self._pending
             outcome = 1 if won else 0
             self.calibration[contract_type].record(raw_prob, outcome)
-            # Same restriction as calibration above: only a real, settled
-            # outcome for the candidate actually traded should move the
-            # martingale progression. A no-op when staking is disabled
-            # (StakingEngine.current_stake always returns base_stake then).
+            self._pending = None
+            self.drift.update_cusum(won)
             self.staking.record_result(self.symbol, won)
-        self._pending = None
-        self.drift.update_cusum(won)
 
     async def evaluate(self, client: DerivClient, currency: str,
                         tick_candidate_durations: list[int], minute_candidate_durations: list[int],
                         n_sims: int = DEFAULT_MC_SIMULATIONS,
                         rng: np.random.Generator | None = None) -> RiseFallDecision:
         rng = rng or np.random.default_rng()
-
         tick_returns = np.array(self.price_series.tick_log_returns, dtype=float)
         minute_returns = np.array(self.price_series.minute_log_returns, dtype=float)
-
         hurst = hurst_rs(minute_returns) if len(minute_returns) >= 50 else hurst_rs(tick_returns)
         sigma_now, sigma_baseline = realized_vol_and_baseline(
             minute_returns if len(minute_returns) >= 60 else tick_returns
         )
         regime, regime_reason = classify_regime(hurst, sigma_now, sigma_baseline)
-
         if regime not in TRADEABLE_REGIMES:
             return RiseFallDecision(self.symbol, "NO_TRADE", regime, regime_reason)
 
@@ -303,70 +275,78 @@ class RiseFallSymbolPipeline:
         # self._pending once a final winner is chosen, without recomputing
         # or re-running the MC scan.
         best: tuple[RiseFallDecision, float, float] | None = None
-        # Tracked purely for a more precise NO_TRADE reason below -- lets
-        # summary_reason() (and app/tick_summary.py's per-gate breakdown)
-        # distinguish "nothing was even confident enough to price" from
-        # "priced fine, but no real edge" instead of collapsing both into
-        # one generic bucket.
-        any_cleared_confidence = False
         for returns, durations, unit in (
             (tick_returns, tick_candidate_durations, "t"),
             (minute_returns, minute_candidate_durations, "m"),
         ):
             if len(returns) < 20 or not durations:
                 continue
+
             for direction, contract_type in ((1, RISE), (-1, FALL)):
                 dur, raw_p = monte_carlo_duration(returns, direction, durations, n_sims=n_sims, rng=rng)
-                calibrated_p = self.calibration[contract_type].calibrate(raw_p)
 
-                # CONFIDENCE GATE: both the raw MC estimate and the
-                # calibrated probability must independently clear
-                # min_confidence before this candidate is even worth a real
-                # quote fetch. See this module's "CONFIDENCE GATE"
-                # docstring for why both, not just the calibrated one.
-                if raw_p <= self.min_confidence or calibrated_p <= self.min_confidence:
+                # CONFIDENCE GATE -- checked on the raw MC estimate first
+                # (cheap, no calibrator call needed) before spending a
+                # get_quote() call on a candidate that can't pass regardless
+                # of price. See module docstring for why no direction flip
+                # is needed here.
+                if raw_p < self.min_confidence:
                     continue
-                any_cleared_confidence = True
+
+                tracker = self.calibration[contract_type]
+                calibrated_p = tracker.calibrate(raw_p)
+                if calibrated_p < self.min_confidence:
+                    continue
+
+                # CALIBRATION-QUALITY GATE -- only enforced once this
+                # contract_type's calibrator has actually fit, and only if
+                # the gate is enabled (min_calibration_quality > 0.0). See
+                # module docstring for the "compared the same number to
+                # itself twice" bug this specifically catches.
+                if (self.min_calibration_quality > 0.0
+                        and getattr(tracker, "is_calibrated", False)
+                        and tracker.quality_score() < self.min_calibration_quality):
+                    continue
 
                 quote = await get_quote(client, self.symbol, contract_type, None, self.base_stake,
                                          dur, unit, currency)
                 if quote is None:
                     continue
+
                 edge_result = compute_edge(quote, calibrated_p)
                 if edge_result.edge < self.min_edge:
                     continue
+
                 if best is None or edge_result.edge > best[1]:
-                    # Martingale (opt-in, see "MARTINGALE STAKING" docstring
-                    # above) replaces the flat base_stake starting point --
-                    # a no-op back to base_stake whenever staking is
-                    # disabled or the progression is currently at step 0.
+                    # Stake now comes from StakingEngine (flat base_stake
+                    # whenever staking is disabled, escalated per
+                    # risk/staking.py's progression otherwise).
                     stake = self.staking.current_stake(self.symbol)
                     live_confidence = calibrated_p if direction > 0 else (1 - calibrated_p)
                     degraded = self.drift.check_all(returns, live_confidence)
                     if degraded:
                         stake = round(stake * DRIFT_STAKE_REDUCTION, 2)
+
                     if stake != self.base_stake:
                         # Re-fetch at the FINAL stake, not the base_stake
-                        # quote already in hand -- needed whenever stake has
-                        # moved away from base_stake for ANY reason (drift
-                        # reduction above, or martingale escalation/
-                        # reduction just above it). OrderExecutor re-quotes
-                        # at intent.stake right before buying and compares
+                        # quote already in hand: OrderExecutor re-quotes at
+                        # intent.stake right before buying and compares
                         # payouts to detect a stale quote (see
-                        # execution/orders.py); payout scales with stake for
+                        # execution/orders.py). Payout scales with stake for
                         # these contracts, so leaving intent.quote at the
                         # base_stake amount while intent.stake is a
-                        # different amount would look like a stale-quote
-                        # payout mismatch and get the trade rejected at
-                        # execution time -- or, worse for martingale
-                        # specifically, silently understate the payout a
-                        # calibration/EV figure was computed against.
+                        # drift-reduced or staking-escalated amount would
+                        # look like a payout mismatch -- OrderExecutor would
+                        # reject the trade as stale every time either
+                        # applies, silently defeating "trade a different
+                        # size", not "don't trade at all".
                         final_quote = await get_quote(client, self.symbol, contract_type, None,
                                                        stake, dur, unit, currency)
                         if final_quote is None:
                             continue
                     else:
                         final_quote = quote
+
                     decision = RiseFallDecision(
                         self.symbol, f"TRADE_{'RISE' if direction > 0 else 'FALL'}", regime,
                         f"{regime_reason}; edge={edge_result.edge:.4f} at {dur}{unit}",
@@ -378,12 +358,9 @@ class RiseFallSymbolPipeline:
                     best = (decision, edge_result.edge, raw_p)
 
         if best is None:
-            if not any_cleared_confidence:
-                return RiseFallDecision(
-                    self.symbol, "NO_TRADE", regime,
-                    f"{regime_reason}; no candidate cleared min_confidence={self.min_confidence}")
             return RiseFallDecision(self.symbol, "NO_TRADE", regime,
                                      f"{regime_reason}; no candidate cleared min_edge={self.min_edge}")
+
         decision, _, raw_p = best
         # Stash pending state ONLY for the candidate actually being traded --
         # see record_outcome()'s docstring for why calibrating any
