@@ -44,7 +44,7 @@ contracts:
 # ceiling).
 rise_fall:
   base_stake: 0.35
-  min_edge: 0.11
+  min_edge: 0.06
   min_calibration_samples: 500
   mc_simulations: 50000
   # See decision/rise_fall_decision_engine.py's "MULTIPLE-COMPARISONS
@@ -55,6 +55,33 @@ rise_fall:
   # min_edge=0.03). Re-measure against real return data, and consider
   # raising min_edge and/or min_calibration_samples, before trusting these
   # defaults in production.
+
+  # CONFIDENCE GATE: a candidate only clears this stage if BOTH its raw MC
+  # win-probability (mc_win_probability) AND its calibrated probability
+  # independently exceed min_confidence -- on top of, not instead of,
+  # min_edge above. See decision/rise_fall_decision_engine.py's "CONFIDENCE
+  # GATE" docstring for why both are required.
+  min_confidence: 0.70
+
+  # Martingale staking for Rise/Fall, routed through risk/staking.py's
+  # StakingEngine (self.staking on RiseFallSymbolPipeline). OFF by default,
+  # deliberately, same reasoning as risk.staking below: a sibling bot ran
+  # martingale live for 278 trades and lost more from it than flat staking
+  # would have, because the top stake tier had no better win rate than the
+  # base tier -- progression amplifies losses when the underlying edge
+  # doesn't hold, it doesn't create edge. Turning this on is a deliberate
+  # choice to re-test that, not a recommended default. Whatever it computes
+  # is still bounded by risk.max_stake below, which app/main.py checks
+  # against the actual decision.stake for every trade.
+  staking:
+    enabled: false
+    progression_factor: 2.0   # classic martingale: double the stake after each loss
+    min_consecutive_losses: 2  # progression only ENGAGES after this many consecutive
+                                # losses -- one isolated loss alone leaves stake at
+                                # base_stake; the second consecutive loss is what first
+                                # escalates it. Set to 1 to escalate after every loss.
+    max_steps: 4               # resets to base_stake after this many consecutive escalations
+    max_stake: 5.0              # hard ceiling on the progression itself, independent of risk.max_stake
 
 feature_windows: [20, 50, 100, 250, 500, 1000, 2500]
 max_markov_order: 3
