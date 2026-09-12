@@ -79,6 +79,27 @@ class StakingEngine:
         # leaving it to each call site to remember.
         return round(min(stake, self.max_stake), 2)
 
+    def get_state(self, symbol: str) -> tuple[int, int]:
+        """(step, consecutive_losses) -- for persisting across restarts
+        (see database/repository.py's save_rise_fall_staking_state). Does
+        NOT allocate a fresh StakingState as a side effect the way _get()
+        does, so calling this for a symbol that's never lost a trade
+        correctly reports (0, 0) without polluting self._state."""
+        state = self._state.get(symbol)
+        if state is None:
+            return 0, 0
+        return state.step, state.consecutive_losses
+
+    def load_state(self, symbol: str, step: int, consecutive_losses: int) -> None:
+        """Restores a previously-persisted (step, consecutive_losses) --
+        e.g. at startup from database/repository.py's
+        load_rise_fall_staking_state. Only meaningful if the caller has
+        deliberately opted into persisting staking state across restarts
+        (see risk/staking.py's module docstring and configs/config.yaml's
+        rise_fall.staking.persist_across_restarts for why this is NOT the
+        default even when martingale itself is enabled)."""
+        self._state[symbol] = StakingState(step=step, consecutive_losses=consecutive_losses)
+
     def record_result(self, symbol: str, won: bool) -> None:
         state = self._get(symbol)
         if won:
