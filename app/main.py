@@ -204,7 +204,27 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
             tick_summary.record_no_trade(summary_reason(decision))
 
         if tick_summary.due():
-            summary = tick_summary.build_and_reset("rise_fall", len(pipeline.price_series.prices))
+            # Per-contract-type calibration diagnostics -- makes it visible
+            # from the logs alone whether a symbol's calibrator has actually
+            # engaged yet (is_calibrated) and, once it has, how reliable it
+            # is (quality_score's ECE-based 0..1 score -- see models/
+            # calibration.py). Without this, "mc_win_probability" and
+            # "calibrated_probability" being identical in an "Executing
+            # trade" log line is indistinguishable from a real, validated
+            # calibration passing raw probabilities straight through by
+            # coincidence -- this is the one place that ambiguity gets
+            # resolved.
+            calibration_stats = {
+                contract_type: {
+                    "n": pipeline.calibration[contract_type].sample_size,
+                    "is_calibrated": pipeline.calibration[contract_type].is_calibrated,
+                    "quality_score": round(pipeline.calibration[contract_type].quality_score(), 3),
+                    "rolling_log_loss": pipeline.calibration[contract_type].rolling_log_loss(),
+                }
+                for contract_type in (RISE, FALL)
+            }
+            summary = tick_summary.build_and_reset("rise_fall", len(pipeline.price_series.prices),
+                                                    calibration_stats)
             log.info("Tick summary", extra={"extra_fields": {"event_type": "tick_summary", **summary.__dict__}})
             repo.insert_system_event("app.symbol_worker", "tick_summary", {"symbol": symbol, **summary.__dict__})
 
