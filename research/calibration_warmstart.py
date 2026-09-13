@@ -46,6 +46,7 @@ about a different pipeline.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -206,3 +207,76 @@ def apply_samples_to_pipeline(pipeline, samples: dict[CalibrationKey, SamplePair
             tracker.record(raw_prob, outcome)
         applied[f"{contract_type}_{unit}"] = len(pairs)
     return applied
+
+
+async def restore_or_generate_calibration(
+    repo, pipeline, symbol: str, *,
+    warm_start_dir: str | None,
+    ticks: list[tuple[int, float]],
+    tick_candidate_durations: list[int],
+    minute_candidate_durations: list[int],
+    auto_generate: bool = False,
+    n_sims: int = DEFAULT_MC_SIMULATIONS,
+    sample_every: int = 5,
+    to_thread=None,
+    on_file_error=None,
+) -> tuple[str, dict[str, int]]:
+    """One symbol's full calibration-restore priority chain, pulled out of
+    app/main.py's startup sequence into a standalone function purely so it's
+    unit-testable without booting the whole app (real Supabase client, real
+    Deriv connection, etc.) -- app/main.py's main() just calls this once per
+    symbol and logs based on the returned outcome tag.
+
+    Priority order (stops at the first that produces something):
+      1. Supabase (repo.load_rise_fall_calibration_state) -- the bot's own
+         continuously-updated state from every previous settlement. Near-
+         instant: just replays stored pairs through .record(), no MC.
+      2. The file-based warm-start at {warm_start_dir}/{symbol}.json, if
+         warm_start_dir is set and that file exists. A corrupt/unreadable
+         file calls on_file_error(path, exc) if provided (app/main.py wires
+         its logger through this -- this module never logs directly, same
+         convention as the rest of it) and falls through to step 3/4 rather
+         than raising -- a bad warm-start file must never block startup.
+      3. Auto-generate (only if auto_generate=True AND ticks is non-empty):
+         replay `ticks` through build_calibration_samples() -- genuinely
+         CPU-bound -- and save the result to Supabase immediately, so this
+         is a one-time cost per symbol; every later call hits step 1
+         instead. Run through `to_thread` (defaults to asyncio.to_thread)
+         rather than awaited inline, so a long replay can't block the
+         event loop; tests can pass a synchronous stand-in to avoid a real
+         thread hop.
+      4. Nothing available -- pipeline starts cold, same as if none of this
+         existed.
+
+    Returns (outcome, applied) where outcome is one of "supabase", "file",
+    "auto_generated", "cold" and applied is the same {"CALL_t": n, ...}
+    dict apply_samples_to_pipeline() returns ({} for "cold").
+    """
+    if to_thread is None:
+        import asyncio
+        to_thread = asyncio.to_thread
+
+    supabase_state = repo.load_rise_fall_calibration_state(symbol)
+    if supabase_state:
+        return "supabase", apply_samples_to_pipeline(pipeline, jsonable_to_samples(supabase_state))
+
+    if warm_start_dir:
+        path = os.path.join(warm_start_dir, f"{symbol}.json")
+        if os.path.exists(path):
+            try:
+                samples = load_samples_json(path)
+                return "file", apply_samples_to_pipeline(pipeline, samples)
+            except Exception as exc:  # noqa: BLE001 -- a bad warm-start file must never block startup
+                if on_file_error is not None:
+                    on_file_error(path, exc)
+
+    if auto_generate and ticks:
+        samples = await to_thread(
+            build_calibration_samples, ticks, tick_candidate_durations, minute_candidate_durations,
+            n_sims=n_sims, sample_every=sample_every,
+        )
+        applied = apply_samples_to_pipeline(pipeline, samples)
+        repo.save_rise_fall_calibration_state(symbol, samples_to_jsonable(samples))
+        return "auto_generated", applied
+
+    return "cold", {}
