@@ -161,6 +161,31 @@ rise_fall:
     max_steps: 4               # resets to base_stake after this many consecutive escalations
     max_stake: 5.0              # hard ceiling on the progression itself, independent of risk.max_stake
 
+  # Multi-layer conviction voting (decision/regime_conviction.py, wired in
+  # via decision/rise_fall_decision_engine.py's "MULTI-LAYER VOTING"), using
+  # four independent signal layers (models/tick_markov.py, ou_zscore.py,
+  # hawkes_momentum.py, kalman_trend.py). RF_REGIME_LAYERS (that module) is
+  # labeled "a STARTING HYPOTHESIS, not a validated mapping" in its own
+  # docstring. conviction_shadow_only=true (the default): conviction is
+  # computed and persisted on every trade (see astra_trades.conviction/
+  # conviction_direction/layer_votes in database/schema.sql) but never
+  # gates direction or sizes stake -- current MC/calibration/edge behavior
+  # is completely unchanged. Currently running an overnight shadow
+  # observation period specifically to build up enough completed trades for
+  # decision/regime_conviction.py's conviction_outcome_report() to say
+  # whether higher conviction actually correlates with a higher win rate
+  # before this is ever allowed to touch a real trade. Do not flip to false
+  # until that report has been run and shows a real, non-flat, non-inverted
+  # relationship -- see that function's own docstring for how to read it.
+  conviction_shadow_only: true
+  conviction_min_voters: 3     # minimum NON-ABSTAINING layers required for a regime's mapped set to
+                                 # count as a consensus at all -- see compute_conviction()'s own docstring
+  conviction_floor: 0.20        # below this, conviction_stake() returns 0 (skip, not "trade small")
+  conviction_min_mult: 0.5      # stake multiplier at conviction == conviction_floor
+  conviction_max_mult: 3.0      # stake multiplier at conviction == 1.0
+  conviction_max_stake: 0.0     # absolute cap on conviction-scaled stake; 0 = uncapped (still bounded
+                                  # by risk.max_stake, checked against the actual decision.stake below)
+
 
 feature_windows: [20, 50, 100, 250, 500, 1000, 2500]
 max_markov_order: 3
