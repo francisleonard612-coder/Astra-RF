@@ -22,19 +22,49 @@ Pipeline, per evaluation:
      not a hard block, consistent with how mild a single drift fire is
      treated everywhere else in the ported material).
 
-Deliberately NOT wired in here: decision/regime_conviction.py's
-regime_votes()/compute_conviction() multi-layer voting and conviction
-sizing. That machinery is designed for genuinely diverse, regime-
-differentiated signals (Hurst, OU, Hawkes, RSI, ...) -- Astra only has TWO
-signals for Rise/Fall right now (MC probability at tick and minute
-resolution), and they're not independent evidence, they're the same method
-at two granularities. Forcing them through compute_conviction()'s
-conviction_min_voters>=3 default would mean it never fires at all; forcing
-a lower threshold would misapply a tool built for a richer signal set than
-exists yet. Stake here is a simple, flat, edge-independent size instead
-(risk/staking.py's existing pattern) until Astra has enough genuinely
-independent Rise/Fall signals to route through regime_conviction properly
--- wiring that in is a deliberate future decision, not an oversight.
+MULTI-LAYER VOTING (conviction_shadow_only, default True): now wired in,
+using decision/regime_conviction.py's regime_votes()/compute_conviction()/
+conviction_stake(), with FOUR genuinely independent signal layers added
+specifically to make this meaningful (models/tick_markov.py,
+models/ou_zscore.py, models/hawkes_momentum.py, models/kalman_trend.py --
+see each module's own docstring for why it's methodologically distinct
+from MC/Hurst and from each other, not just another view of the same tick
+data). RF_REGIME_LAYERS below is a STARTING HYPOTHESIS for which layers
+belong to which regime (momentum-family layers for TREND_*, reversion +
+neutral-in-trend layers for RANGE_QUIET, matching each layer's own stated
+assumptions about what kind of market it's reading) -- not a validated
+mapping, and it should be checked against conviction_outcome_report()
+before being trusted.
+
+conviction_shadow_only=True (the default) computes layer_votes and
+conviction on every candidate and logs them on RiseFallDecision, but does
+NOT let conviction affect which direction gets evaluated or how a trade is
+sized -- existing MC/calibration/edge behavior is completely unchanged
+while shadow mode is on. Flip it to False only after
+conviction_outcome_report() shows win rate actually climbing across
+conviction buckets on accumulated shadow data; until then this is
+observation, not control. Once live (conviction_shadow_only=False):
+  - A resolution (tick or minute) whose regime maps to >=3 voting layers
+    but produces no directional consensus (conviction_direction == 0) is
+    skipped entirely for that cycle -- see "no_conviction_consensus" in
+    summary_reason() below.
+  - Otherwise, ONLY the conviction-approved direction is evaluated for
+    that resolution (RISE candidates skipped if conviction leans FALL, and
+    vice versa) -- this also directly narrows the MULTIPLE-COMPARISONS
+    WARNING below from up to 4 candidates/cycle toward at most 2 (one per
+    resolution), not by fiat but as a side effect of already requiring
+    directional agreement before a candidate is even considered.
+  - The existing MC/calibration/edge gate below is UNCHANGED and still
+    required in full -- conviction adds a second, independent gate plus a
+    stake multiplier on top of it, it does not replace "mispricing against
+    Deriv's ACTUAL payout is the trade gate" (see step 4 below, which
+    still applies exactly as written).
+  - conviction_stake() further scales whatever stake staking/drift-
+    reduction already produced (see "MARTINGALE STAKING" below) -- a
+    conviction below conviction_floor (default 0.20) zeroes the stake and
+    the candidate is skipped even if every other gate cleared, matching
+    conviction_stake()'s own "marginal reads are skipped entirely, not
+    sized down to near-nothing" design.
 
 Also NOT wired in here: OnlineMetaLearner (models/online_meta_learner.py)
 -- same reasoning, needs a real feature vector this engine doesn't build
@@ -206,6 +236,10 @@ import numpy as np
 from ingestion.deriv_client import DerivClient
 from models.calibration import CalibrationTracker
 from models.drift_detector import DriftDetector
+from models.hawkes_momentum import HawkesMomentumModel
+from models.kalman_trend import KalmanTrendModel
+from models.ou_zscore import OUMeanReversionModel
+from models.tick_markov import TickMarkovModel
 from pricing.contracts import FALL, RISE
 from pricing.edge import compute_edge
 from pricing.monte_carlo_duration import DEFAULT_MC_SIMULATIONS, monte_carlo_duration
@@ -213,10 +247,37 @@ from pricing.payout import ContractQuote, get_quote
 from risk.staking import StakingEngine
 from state.price_series import PriceSeries
 
-from decision.regime_conviction import TRADEABLE_REGIMES, classify_regime
+from decision.regime_conviction import (
+    TRADEABLE_REGIMES,
+    classify_regime,
+    compute_conviction,
+    conviction_stake,
+    regime_votes,
+)
 from regime.hurst_volatility import hurst_rs, realized_vol_and_baseline
 
 DRIFT_STAKE_REDUCTION = 0.50  # matches the source's own response to a degraded DriftDetector
+
+# All four new signal layers, by name -- must match the keys evaluate()
+# builds in layer_votes each cycle.
+RF_ALL_LAYER_NAMES = ["tick_markov", "ou_zscore", "hawkes_momentum", "kalman_trend"]
+
+# STARTING HYPOTHESIS, not a validated mapping -- see the module docstring's
+# "MULTI-LAYER VOTING" section above. Momentum-family layers (tick_markov,
+# hawkes_momentum, kalman_trend) for regimes where persistence is expected;
+# ou_zscore is DELIBERATELY EXCLUDED from TREND_* -- it assumes reversion
+# toward a fitted equilibrium, which is exactly backwards for a market
+# genuinely mid-trend, so including it there would be voting against the
+# regime's own premise rather than adding independent evidence.
+# kalman_trend is included in RANGE_QUIET too: a real range-bound market
+# should make it read near-zero (an honest low-magnitude vote), not force
+# it to abstain -- there's no assumption in it that's actively wrong there,
+# unlike ou_zscore in a trend.
+RF_REGIME_LAYERS: dict[str, list[str]] = {
+    "TREND_QUIET": ["tick_markov", "hawkes_momentum", "kalman_trend"],
+    "TREND_VOLATILE": ["tick_markov", "hawkes_momentum", "kalman_trend"],
+    "RANGE_QUIET": ["ou_zscore", "tick_markov", "kalman_trend"],
+}
 
 
 @dataclass
@@ -239,6 +300,13 @@ class RiseFallDecision:
     is_calibration_probe: bool = False  # True if this candidate only got through because the
                                          # "PROBE TRADES" escape hatch bypassed the quality gate --
                                          # see decision/rise_fall_decision_engine.py's module docstring
+    layer_votes: dict[str, float] | None = None   # this resolution's raw per-layer votes, logged
+                                                    # even in shadow mode -- see "MULTI-LAYER VOTING"
+    conviction: float | None = None                # compute_conviction()'s 0..1 output, or None if
+                                                    # this regime has <3 mapped layers (never computed)
+    conviction_direction: int | None = None         # -1 / 0 / +1, or None -- same condition as above
+    conviction_applied: bool = False                # True only if conviction actually gated/sized this
+                                                    # candidate (i.e. conviction_shadow_only was False)
 
 
 def summary_reason(decision: RiseFallDecision) -> str:
@@ -258,6 +326,10 @@ def summary_reason(decision: RiseFallDecision) -> str:
         return "insufficient_confidence"
     if "no candidate cleared min_edge" in decision.reason:
         return "insufficient_edge"
+    if "no conviction consensus" in decision.reason:
+        return "no_conviction_consensus"
+    if "conviction below floor" in decision.reason:
+        return "conviction_below_floor"
     return "unknown"
 
 
@@ -268,7 +340,10 @@ class RiseFallSymbolPipeline:
                  calibration_quality_probe_interval: int = 50,
                  staking_enabled: bool = False, staking_progression_factor: float = 2.0,
                  staking_max_steps: int = 4, staking_max_stake: float | None = None,
-                 staking_min_consecutive_losses: int = 2):
+                 staking_min_consecutive_losses: int = 2,
+                 conviction_shadow_only: bool = True, conviction_min_voters: int = 3,
+                 conviction_floor: float = 0.20, conviction_min_mult: float = 0.5,
+                 conviction_max_mult: float = 3.0, conviction_max_stake: float = 0.0):
         self.symbol = symbol
         self.base_stake = base_stake
         self.min_edge = min_edge
@@ -300,6 +375,26 @@ class RiseFallSymbolPipeline:
         # docstring above for exactly when this increments vs. resets.
         self._quality_gate_blocked_streak: dict[tuple[str, str], int] = {key: 0 for key in self.calibration}
         self.drift = DriftDetector()
+        # See "MULTI-LAYER VOTING" docstring above. One instance per
+        # (layer, resolution) -- 8 total -- never pooling tick and minute
+        # observations into one instance, same reasoning as the four
+        # CalibrationTrackers above.
+        self.tick_markov: dict[str, TickMarkovModel] = {"t": TickMarkovModel(), "m": TickMarkovModel()}
+        self.ou: dict[str, OUMeanReversionModel] = {"t": OUMeanReversionModel(), "m": OUMeanReversionModel()}
+        self.hawkes: dict[str, HawkesMomentumModel] = {"t": HawkesMomentumModel(), "m": HawkesMomentumModel()}
+        self.kalman: dict[str, KalmanTrendModel] = {"t": KalmanTrendModel(), "m": KalmanTrendModel()}
+        # Default True: compute + log conviction on every candidate without
+        # letting it affect direction filtering or stake sizing. See
+        # "MULTI-LAYER VOTING" docstring above for exactly what changes
+        # once this is set False.
+        self.conviction_shadow_only = conviction_shadow_only
+        self.conviction_cfg = {
+            "conviction_min_voters": conviction_min_voters,
+            "conviction_floor": conviction_floor,
+            "conviction_min_mult": conviction_min_mult,
+            "conviction_max_mult": conviction_max_mult,
+            "conviction_max_stake": conviction_max_stake,
+        }
         # Opt-in martingale staking -- see this module's "MARTINGALE
         # STAKING" docstring above and risk/staking.py's own warning.
         # Defaults to disabled (flat base_stake), matching Astra's
@@ -328,7 +423,30 @@ class RiseFallSymbolPipeline:
         self._pending: tuple[str, str, float] | None = None  # (contract_type, unit, raw_prob)
 
     def observe_tick(self, epoch: int, price: float) -> None:
+        n_ticks_before = len(self.price_series.tick_log_returns)
+        n_minutes_before = len(self.price_series.minute_log_returns)
         self.price_series.push(epoch, price)
+
+        # Tick resolution: OU and Kalman take price directly (they fit on
+        # log-price internally); tick_markov and hawkes take the log-return
+        # PriceSeries just computed -- only fire on ticks that actually
+        # produced one (the very first tick for a symbol doesn't).
+        self.ou["t"].push(price)
+        self.kalman["t"].push(price)
+        if len(self.price_series.tick_log_returns) > n_ticks_before:
+            tick_lr = self.price_series.tick_log_returns[-1]
+            self.tick_markov["t"].push(tick_lr)
+            self.hawkes["t"].push(tick_lr)
+
+        # Minute resolution: only fires when a minute bar just closed --
+        # same event PriceSeries.minute_log_returns/minute_closes append on.
+        if len(self.price_series.minute_log_returns) > n_minutes_before:
+            minute_lr = self.price_series.minute_log_returns[-1]
+            minute_close = self.price_series.minute_closes[-1]
+            self.ou["m"].push(minute_close)
+            self.kalman["m"].push(minute_close)
+            self.tick_markov["m"].push(minute_lr)
+            self.hawkes["m"].push(minute_lr)
 
     def cancel_pending(self) -> None:
         """Clears pending state WITHOUT recording any calibration outcome or
@@ -423,12 +541,52 @@ class RiseFallSymbolPipeline:
         # one generic bucket.
         any_cleared_quality = False
         any_cleared_confidence = False
+        any_unit_no_consensus = False    # see "MULTI-LAYER VOTING" docstring above
+        any_conviction_floor_blocked = False
+        # Snapshot of whichever resolution was evaluated last -- attached to
+        # whatever RiseFallDecision this call ends up returning (TRADE or
+        # NO_TRADE) purely for visibility (app/tick_summary.py, Supabase
+        # logging). Regime is shared across both resolutions already
+        # (classified once, above); layer_votes/conviction are NOT, since
+        # each resolution has its own signal-model instances.
+        last_layer_votes: dict[str, float] | None = None
+        last_conviction: float | None = None
+        last_conviction_direction: int | None = None
+
         for returns, durations, unit in (
             (tick_returns, tick_candidate_durations, "t"),
             (minute_returns, minute_candidate_durations, "m"),
         ):
             if len(returns) < 20 or not durations:
                 continue
+
+            layer_votes = {
+                "tick_markov": self.tick_markov[unit].vote(),
+                "ou_zscore": self.ou[unit].vote(),
+                "hawkes_momentum": self.hawkes[unit].vote(),
+                "kalman_trend": self.kalman[unit].vote(),
+            }
+            votes = regime_votes(layer_votes, regime, RF_REGIME_LAYERS)
+            conviction, conviction_direction, _conviction_reason = compute_conviction(
+                votes, self.conviction_cfg)
+            last_layer_votes, last_conviction, last_conviction_direction = (
+                layer_votes, conviction, conviction_direction)
+            # Non-probe candidates in this resolution may only trade the
+            # conviction-approved direction; conviction_direction == 0
+            # (no consensus) allows none. Probe candidates (determined
+            # below, per contract_type) are EXEMPT from this entirely --
+            # same reasoning as their martingale exemption: a probe's whole
+            # purpose is forcing a real settlement for a specific blocked
+            # (contract_type, unit) key regardless of what any other signal
+            # says, so gating it on conviction direction too could
+            # recreate the exact permanent lockout probing exists to fix.
+            allowed_directions = (
+                {1, -1} if self.conviction_shadow_only
+                else ({conviction_direction} if conviction_direction != 0 else set())
+            )
+            if not self.conviction_shadow_only and conviction_direction == 0:
+                any_unit_no_consensus = True
+
             for direction, contract_type in ((1, RISE), (-1, FALL)):
                 dur, raw_p = monte_carlo_duration(returns, direction, durations, n_sims=n_sims, rng=rng)
                 cal = self.calibration[(contract_type, unit)]
@@ -453,6 +611,12 @@ class RiseFallSymbolPipeline:
                 else:
                     self._quality_gate_blocked_streak[streak_key] = 0
                 any_cleared_quality = True
+
+                # CONVICTION DIRECTION GATE -- see "MULTI-LAYER VOTING"
+                # docstring above. A no-op in shadow mode (allowed_directions
+                # is always {1, -1} there) and always a no-op for probes.
+                if not is_probe and direction not in allowed_directions:
+                    continue
 
                 # CONFIDENCE GATE: both the raw MC estimate and the
                 # calibrated probability must independently clear
@@ -485,6 +649,22 @@ class RiseFallSymbolPipeline:
                     degraded = self.drift.check_all(returns, live_confidence)
                     if degraded:
                         stake = round(stake * DRIFT_STAKE_REDUCTION, 2)
+                    # CONVICTION STAKE SIZING -- see "MULTI-LAYER VOTING"
+                    # docstring above. Skipped entirely in shadow mode and
+                    # for probes (same exemption reasoning as the direction
+                    # gate just above): conviction_stake() further scales
+                    # whatever staking/drift already produced, and can zero
+                    # it out below conviction_floor -- a real, independent
+                    # gate on top of edge/confidence/quality, not a
+                    # replacement for any of them.
+                    conviction_applied = False
+                    if not self.conviction_shadow_only and not is_probe:
+                        stake, _stake_why = conviction_stake(conviction, stake, self.conviction_cfg)
+                        stake = round(stake, 2)
+                        conviction_applied = True
+                        if stake <= 0:
+                            any_conviction_floor_blocked = True
+                            continue
                     if stake != self.base_stake:
                         # Re-fetch at the FINAL stake, not the base_stake
                         # quote already in hand -- needed whenever stake has
@@ -516,20 +696,39 @@ class RiseFallSymbolPipeline:
                         mc_win_probability=raw_p, calibrated_probability=calibrated_p,
                         drift_degraded=degraded, quote=final_quote,
                         is_calibration_probe=is_probe,
+                        layer_votes=layer_votes, conviction=conviction,
+                        conviction_direction=conviction_direction,
+                        conviction_applied=conviction_applied,
                     )
                     best = (decision, edge_result.edge, raw_p)
 
         if best is None:
+            common_kwargs = dict(layer_votes=last_layer_votes, conviction=last_conviction,
+                                  conviction_direction=last_conviction_direction,
+                                  conviction_applied=not self.conviction_shadow_only)
+            if any_unit_no_consensus and not any_cleared_quality and not any_cleared_confidence:
+                return RiseFallDecision(
+                    self.symbol, "NO_TRADE", regime,
+                    f"{regime_reason}; no conviction consensus (conviction_direction=0)",
+                    **common_kwargs)
             if not any_cleared_quality:
                 return RiseFallDecision(
                     self.symbol, "NO_TRADE", regime,
-                    f"{regime_reason}; no candidate cleared min_calibration_quality={self.min_calibration_quality}")
+                    f"{regime_reason}; no candidate cleared min_calibration_quality={self.min_calibration_quality}",
+                    **common_kwargs)
             if not any_cleared_confidence:
                 return RiseFallDecision(
                     self.symbol, "NO_TRADE", regime,
-                    f"{regime_reason}; no candidate cleared min_confidence={self.min_confidence}")
+                    f"{regime_reason}; no candidate cleared min_confidence={self.min_confidence}",
+                    **common_kwargs)
+            if any_conviction_floor_blocked:
+                return RiseFallDecision(
+                    self.symbol, "NO_TRADE", regime,
+                    f"{regime_reason}; conviction below floor={self.conviction_cfg['conviction_floor']}",
+                    **common_kwargs)
             return RiseFallDecision(self.symbol, "NO_TRADE", regime,
-                                     f"{regime_reason}; no candidate cleared min_edge={self.min_edge}")
+                                     f"{regime_reason}; no candidate cleared min_edge={self.min_edge}",
+                                     **common_kwargs)
         decision, _, raw_p = best
         # Stash pending state ONLY for the candidate actually being traded --
         # see record_outcome()'s docstring for why calibrating any
