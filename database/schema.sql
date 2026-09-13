@@ -163,6 +163,46 @@ create table if not exists astra_symbol_state (
 -- weighting was added. Safe to re-run.
 alter table astra_model_performance add column if not exists weight_per_digit jsonb;
 
+-- Restart-recovery snapshot for Rise/Fall's four independent per-
+-- (contract_type, resolution) CalibrationTrackers (see
+-- decision/rise_fall_decision_engine.py's "PER-RESOLUTION CALIBRATION").
+-- Without this, every Railway restart/redeploy reset calibration back to a
+-- cold, pass-through state -- the exact problem calibration warm-start
+-- (research/calibration_warmstart.py) was originally built to shortcut
+-- around as a one-off, manually-generated-and-uploaded file. This table
+-- lets the bot keep its OWN accumulated calibration current across
+-- restarts automatically, no manual replay/upload step needed after the
+-- first one. Stores the raw (raw_prob, outcome) sample pairs, not the
+-- fitted sklearn calibrator object itself -- reloading and replaying them
+-- through CalibrationTracker.record() (the exact same call a live
+-- settlement makes) naturally re-fits the calibrator exactly as before,
+-- same pattern research/calibration_warmstart.py's
+-- apply_samples_to_pipeline() already uses for the file-based warm-start.
+-- Overwritten (not appended), same pattern as astra_symbol_state /
+-- astra_digit_specialist_state above.
+create table if not exists astra_rise_fall_calibration_state (
+    symbol text primary key,
+    updated_at timestamptz not null default now(),
+    -- {"CALL_t": {"raw": [...], "outcome": [...]}, "CALL_m": {...},
+    --  "PUT_t": {...}, "PUT_m": {...}}
+    calibration jsonb not null default '{}'::jsonb
+);
+
+-- Restart-recovery snapshot for Rise/Fall's opt-in martingale progression
+-- (risk/staking.py's StakingEngine, wired in via
+-- RiseFallSymbolPipeline.staking). Unlike calibration state above, this is
+-- NOT unconditionally a good idea to restore -- see app/main.py's
+-- rise_fall.staking.persist_across_restarts config flag (default false):
+-- a restart currently resets an escalated stake back to base_stake, which
+-- can be read either as lost progression (a reason to persist this) or as
+-- an accidental safety net (a reason not to) -- only persist deliberately.
+create table if not exists astra_rise_fall_staking_state (
+    symbol text primary key,
+    updated_at timestamptz not null default now(),
+    step integer not null default 0,
+    consecutive_losses integer not null default 0
+);
+
 -- Migration: which architecture (global | specialist | hybrid) actually
 -- produced a given prediction row. Safe to re-run.
 alter table astra_predictions add column if not exists architecture text;
