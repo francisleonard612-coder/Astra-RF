@@ -102,6 +102,15 @@ class Repository:
             "symbol": trade.symbol, "contract_type": trade.contract_type, "barrier": trade.barrier,
             "stake": trade.stake, "payout": trade.payout, "contract_id": trade.contract_id,
             "won": trade.won, "pnl": trade.pnl, "error": trade.error, "prediction_id": prediction_id,
+            # None for every digit trade and for any Rise/Fall trade made
+            # while conviction_shadow_only=True never gated/sized it -- see
+            # TradeIntent/TradeResult's own comments in execution/orders.py.
+            # This is what conviction_outcome_report() (decision/
+            # regime_conviction.py) needs completed trades to carry in
+            # order to check "does higher conviction actually mean higher
+            # win rate" against real outcomes.
+            "conviction": trade.conviction, "conviction_direction": trade.conviction_direction,
+            "layer_votes": trade.layer_votes,
         })
         self._safe(lambda: self.client.table("astra_trades").insert(row).execute())
 
