@@ -39,26 +39,15 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass
 class DerivConfig:
-    # .strip() here isn't cosmetic: a Railway env var (or a .env line) with
-    # a trailing space or newline from a copy-paste is completely invisible
-    # in the dashboard but changes the literal bytes sent in the
-    # `Authorization: Bearer <token>` header. Deriv's server compares the
-    # token exactly and returns a perfectly generic "Invalid or expired
-    # token" 401 for this -- indistinguishable from an actually-wrong or
-    # revoked token from the error text alone, which made this look like a
-    # credentials problem rather than a whitespace one. The numeric/bool env
-    # helpers below (_env_bool, and float()/int() themselves) already
-    # tolerate surrounding whitespace; the raw string credential fields
-    # never did.
     app_id: str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089").strip())
     api_token: str = field(default_factory=lambda: os.getenv("DERIV_API_TOKEN", "").strip())
     # Legacy WS host, only used as a last-resort fallback if Deriv's OTP response
     # ever omits the ready-to-use websocket URL (see DerivClient._exchange_otp).
-    ws_url: str = field(default_factory=lambda: os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/demo").strip())
+    ws_url: str = field(default_factory=lambda: os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/demo"))
     # REST API base URL. DerivClient appends /trading/v1/options/accounts[...]
     # itself, so this should just be the host -- do not include a path.
     options_token_url: str = field(
-        default_factory=lambda: os.getenv("DERIV_OPTIONS_TOKEN_URL", "https://api.derivws.com").strip()
+        default_factory=lambda: os.getenv("DERIV_OPTIONS_TOKEN_URL", "https://api.derivws.com")
     )
     # Optional: pin a specific Options account id (e.g. "DOT90004580") instead of
     # letting DerivClient auto-resolve one from GET /accounts. Leave unset to
