@@ -140,29 +140,35 @@ def test_dramatic_mispricing_produces_a_trade_regardless_of_regime_noise():
 
 def test_record_outcome_calibrates_only_the_traded_candidate_rise():
     pipeline = RiseFallSymbolPipeline("1HZ10V")
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
 
     pipeline.record_outcome(won=True)
 
-    # RISE won -> price went up -> outcome=1 for RISE's own calibration
-    assert pipeline.calibration[RISE]._outcome[-1] == 1
-    assert pipeline.calibration[RISE]._raw[-1] == 0.8
-    # FALL was NOT the traded candidate this cycle -- untouched
-    assert len(pipeline.calibration[FALL]._outcome) == 0
+    # RISE won -> price went up -> outcome=1 for RISE-tick's own calibration
+    assert pipeline.calibration[(RISE, "t")]._outcome[-1] == 1
+    assert pipeline.calibration[(RISE, "t")]._raw[-1] == 0.8
+    # None of the other three (contract_type, resolution) trackers were the
+    # traded candidate this cycle -- untouched
+    assert len(pipeline.calibration[(RISE, "m")]._outcome) == 0
+    assert len(pipeline.calibration[(FALL, "t")]._outcome) == 0
+    assert len(pipeline.calibration[(FALL, "m")]._outcome) == 0
     assert pipeline._pending is None
 
 
 def test_record_outcome_calibrates_only_the_traded_candidate_fall():
     pipeline = RiseFallSymbolPipeline("1HZ10V")
-    pipeline._pending = (FALL, 0.7)
+    pipeline._pending = (FALL, "m", 0.7)
 
     pipeline.record_outcome(won=True)
 
-    # FALL won -> price went DOWN -> outcome=1 for FALL's own calibration
-    # (FALL's raw_prob was a probability of price falling, and it did)
-    assert pipeline.calibration[FALL]._outcome[-1] == 1
-    assert pipeline.calibration[FALL]._raw[-1] == 0.7
-    assert len(pipeline.calibration[RISE]._outcome) == 0
+    # FALL won -> price went DOWN -> outcome=1 for FALL-minute's own
+    # calibration (FALL's raw_prob was a probability of price falling, and
+    # it did)
+    assert pipeline.calibration[(FALL, "m")]._outcome[-1] == 1
+    assert pipeline.calibration[(FALL, "m")]._raw[-1] == 0.7
+    assert len(pipeline.calibration[(FALL, "t")]._outcome) == 0
+    assert len(pipeline.calibration[(RISE, "t")]._outcome) == 0
+    assert len(pipeline.calibration[(RISE, "m")]._outcome) == 0
 
 
 def test_record_outcome_with_no_pending_candidate_only_feeds_cusum():
@@ -170,13 +176,13 @@ def test_record_outcome_with_no_pending_candidate_only_feeds_cusum():
     stat_before = pipeline.drift._cusum_stat
     pipeline.record_outcome(won=False)  # no evaluate() ran first -- nothing pending
     assert pipeline.drift._cusum_stat > stat_before
-    assert len(pipeline.calibration[RISE]._outcome) == 0
-    assert len(pipeline.calibration[FALL]._outcome) == 0
+    for key in ((RISE, "t"), (RISE, "m"), (FALL, "t"), (FALL, "m")):
+        assert len(pipeline.calibration[key]._outcome) == 0
 
 
 def test_record_outcome_always_feeds_cusum():
     pipeline = RiseFallSymbolPipeline("1HZ10V")
-    pipeline._pending = (RISE, 0.6)
+    pipeline._pending = (RISE, "t", 0.6)
     stat_before = pipeline.drift._cusum_stat
     pipeline.record_outcome(won=False)
     assert pipeline.drift._cusum_stat > stat_before  # a loss pushes CUSUM up
@@ -194,8 +200,9 @@ def test_evaluate_stashes_pending_state_only_for_the_winning_candidate():
                                             rng=np.random.default_rng(0))
         assert decision.decision != "NO_TRADE"
         assert pipeline._pending is not None
-        pending_type, pending_prob = pipeline._pending
+        pending_type, pending_unit, pending_prob = pipeline._pending
         assert pending_type == decision.contract_type
+        assert pending_unit == decision.duration_unit
         assert pending_prob == decision.mc_win_probability
 
     asyncio.run(run())
@@ -203,13 +210,13 @@ def test_evaluate_stashes_pending_state_only_for_the_winning_candidate():
 
 def test_cancel_pending_clears_without_recording_anything():
     pipeline = RiseFallSymbolPipeline("1HZ10V")
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     stat_before = pipeline.drift._cusum_stat
 
     pipeline.cancel_pending()
 
     assert pipeline._pending is None
-    assert len(pipeline.calibration[RISE]._outcome) == 0  # nothing recorded
+    assert len(pipeline.calibration[(RISE, "t")]._outcome) == 0  # nothing recorded
     assert pipeline.drift._cusum_stat == stat_before  # CUSUM untouched
 
 

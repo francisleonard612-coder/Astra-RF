@@ -167,7 +167,7 @@ def test_staking_enabled_does_not_escalate_after_a_single_isolated_loss():
         staking_enabled=True, staking_progression_factor=2.0, staking_max_steps=4, staking_max_stake=100.0,
     )
     assert pipeline.staking.min_consecutive_losses_before_escalation == 2  # Rise/Fall's own default
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)  # first loss in the streak
     assert pipeline.staking.current_stake("1HZ10V") == 1.0  # unchanged -- threshold not yet reached
 
@@ -256,16 +256,16 @@ def test_staking_max_steps_stops_escalating_and_resets():
         "1HZ10V", base_stake=1.0,
         staking_enabled=True, staking_progression_factor=2.0, staking_max_steps=2, staking_max_stake=100.0,
     )
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)  # loss #1 -- below threshold, stake unchanged
     assert pipeline.staking.current_stake("1HZ10V") == 1.0
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)  # loss #2 -- threshold reached, step 1 -> stake 2.0
     assert pipeline.staking.current_stake("1HZ10V") == 2.0
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)  # loss #3 -- step 2 (== max_steps) -> stake 4.0
     assert pipeline.staking.current_stake("1HZ10V") == 4.0
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)  # loss #4 -- beyond max_steps -> resets to step 0
     assert pipeline.staking.current_stake("1HZ10V") == 1.0
 
@@ -276,7 +276,7 @@ def test_staking_respects_its_own_max_stake_ceiling():
         staking_enabled=True, staking_progression_factor=2.0, staking_max_steps=10, staking_max_stake=3.0,
     )
     for _ in range(6):
-        pipeline._pending = (RISE, 0.8)
+        pipeline._pending = (RISE, "t", 0.8)
         pipeline.record_outcome(won=False)
     assert pipeline.staking.current_stake("1HZ10V") <= 3.0
 
@@ -287,15 +287,15 @@ def test_cancel_pending_does_not_move_the_staking_progression():
         staking_enabled=True, staking_progression_factor=2.0, staking_max_steps=4, staking_max_stake=100.0,
     )
     # two real consecutive losses -- crosses the threshold, escalates to step 1
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.record_outcome(won=False)
     assert pipeline.staking.current_stake("1HZ10V") == 2.0
 
     # a trade that was decided but never actually settled must NOT count
     # as a third loss just because cancel_pending() was called
-    pipeline._pending = (RISE, 0.8)
+    pipeline._pending = (RISE, "t", 0.8)
     pipeline.cancel_pending()
     assert pipeline.staking.current_stake("1HZ10V") == 2.0  # unchanged
 
