@@ -51,6 +51,17 @@ class TradeIntent:
     currency: str
     quote: ContractQuote        # the quote the decision was actually made against
     barrier: int | None = None  # digit contracts only; None for Rise/Fall
+    # Conviction fields (decision/rise_fall_decision_engine.py's "MULTI-LAYER
+    # VOTING") -- None for the digit decision engine (intent_from_digit_
+    # decision never sets these). Carried on TradeIntent, not just
+    # RiseFallDecision, so they survive through to the SETTLED TradeResult
+    # in _watch_and_finalize below and reach astra_trades -- without this,
+    # conviction_outcome_report() (decision/regime_conviction.py) has no
+    # completed-trade data to check "does higher conviction actually mean
+    # higher win rate" against, which is the entire point of computing it.
+    conviction: float | None = None
+    conviction_direction: int | None = None
+    layer_votes: dict | None = None
 
 
 @dataclass
@@ -64,6 +75,10 @@ class TradeResult:
     won: bool | None
     pnl: float | None
     error: str | None = None
+    # Carried through from TradeIntent -- see that dataclass's own comment.
+    conviction: float | None = None
+    conviction_direction: int | None = None
+    layer_votes: dict | None = None
 
 
 def intent_from_digit_decision(decision, duration: int, duration_unit: str, currency: str) -> TradeIntent | None:
@@ -101,6 +116,8 @@ def intent_from_rise_fall_decision(decision, currency: str) -> TradeIntent | Non
         symbol=decision.symbol, contract_type=decision.contract_type, stake=decision.stake,
         duration=decision.duration, duration_unit=decision.duration_unit, currency=currency,
         quote=decision.quote, barrier=None,
+        conviction=decision.conviction, conviction_direction=decision.conviction_direction,
+        layer_votes=decision.layer_votes,
     )
 
 
@@ -159,7 +176,9 @@ class OrderExecutor:
             }})
             self.risk_engine.release_trade_slot()
             result = TradeResult(intent.symbol, intent.contract_type, intent.barrier, intent.stake,
-                                  fresh_quote.payout, None, None, 0.0, error=None)
+                                  fresh_quote.payout, None, None, 0.0, error=None,
+                                  conviction=intent.conviction, conviction_direction=intent.conviction_direction,
+                                  layer_votes=intent.layer_votes)
             self.repo.insert_trade(result, prediction_id)
             # pnl=0.0 here (not None) is deliberate, matching a real
             # settled trade's bookkeeping call below -- dry_run should
@@ -190,7 +209,9 @@ class OrderExecutor:
             return self._fail(intent, fresh_quote.payout, "buy_response_missing_contract_id", prediction_id)
 
         result = TradeResult(intent.symbol, intent.contract_type, intent.barrier, intent.stake,
-                              fresh_quote.payout, contract_id, None, None, error=None)
+                              fresh_quote.payout, contract_id, None, None, error=None,
+                              conviction=intent.conviction, conviction_direction=intent.conviction_direction,
+                              layer_votes=intent.layer_votes)
         task = asyncio.create_task(
             self._watch_and_finalize(intent, contract_id, fresh_quote.payout, prediction_id, on_settled),
             name=f"settle-{intent.symbol}-{contract_id}",
@@ -208,7 +229,9 @@ class OrderExecutor:
         # exactly the record you want when diagnosing why trades aren't
         # landing.
         result = TradeResult(intent.symbol, intent.contract_type, intent.barrier, intent.stake,
-                              payout, None, None, None, error=error)
+                              payout, None, None, None, error=error,
+                              conviction=intent.conviction, conviction_direction=intent.conviction_direction,
+                              layer_votes=intent.layer_votes)
         self.repo.insert_trade(result, prediction_id)
         return result
 
@@ -234,13 +257,17 @@ class OrderExecutor:
             else:
                 error = "settlement_timeout_or_unknown"
             result = TradeResult(intent.symbol, intent.contract_type, intent.barrier, intent.stake,
-                                  payout, contract_id, won, pnl, error=error)
+                                  payout, contract_id, won, pnl, error=error,
+                                  conviction=intent.conviction, conviction_direction=intent.conviction_direction,
+                                  layer_votes=intent.layer_votes)
         except Exception as exc:  # noqa: BLE001
             logger.error("Settlement watcher crashed", exc_info=exc, extra={"extra_fields": {
                 "symbol": intent.symbol, "contract_id": contract_id,
             }})
             result = TradeResult(intent.symbol, intent.contract_type, intent.barrier, intent.stake,
-                                  payout, contract_id, None, None, error=str(exc))
+                                  payout, contract_id, None, None, error=str(exc),
+                                  conviction=intent.conviction, conviction_direction=intent.conviction_direction,
+                                  layer_votes=intent.layer_votes)
         finally:
             self.risk_engine.release_trade_slot()
 
