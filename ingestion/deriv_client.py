@@ -32,25 +32,6 @@ Two hard lessons from earlier bots in this account are baked in here:
    request/response calls (proposal, buy, active_symbols, ticks_history) are
    resolved via a dict of `asyncio.Future`s keyed by req_id, and
    `_recv_pump` only ever does `future.set_result(...)`, never `await`.
-
-3. RECV PUMP DEATH MUST NEVER BE A SILENT, PERMANENT OUTAGE: found from a
-   real production log -- `_recv_pump` crashed on
-   `ConnectionClosedError: no close frame received or sent` (Deriv or the
-   network dropped the socket without a clean close handshake), logged
-   "Recv pump crashed", and simply returned. Nothing else in this client
-   reconnects the TICK path automatically: `ensure_connected()` only runs
-   from `_send()`'s request/response path (proposal, buy, ticks_history,
-   ...), which a pure tick-consuming `symbol_worker()` loop never calls --
-   it just awaits its `asyncio.Queue` filling. So once the pump died, the
-   process kept running (looked healthy in Railway) but every symbol's tick
-   feed, and therefore all trading, silently stopped forever until a manual
-   restart. `_run_recv_pump_forever()` (spawned by `connect()` instead of
-   `_recv_pump` directly) supervises this: whenever `_recv_pump()` exits for
-   any reason, it reconnects (backing off up to 30s between attempts) and
-   resubscribes every live tick symbol before resuming the pump. This lives
-   OUTSIDE `_recv_pump()` itself -- the reconnect only ever runs after the
-   pump has already returned, never from within its loop -- so it doesn't
-   violate rule 2 above.
 """
 from __future__ import annotations
 
@@ -172,58 +153,11 @@ class DerivClient:
                     "event_type": "account_resolved", "account_id": self.account_id,
                     "wanted": "real" if self.use_real_account else "demo",
                 }})
-            await self._open_socket()
-            # ONE long-lived supervisor task for the whole life of this
-            # client, not re-spawned on every reconnect -- see this module's
-            # docstring point 3 and _run_recv_pump_forever()'s own docstring
-            # for why a fresh task per reconnect would risk two supervisors
-            # racing to read the same (or a just-replaced) socket.
-            self._recv_task = asyncio.create_task(self._run_recv_pump_forever(), name="deriv-recv-pump")
+            auth_url = await self._exchange_otp(self.account_id)
+            self._ws = await websockets.connect(auth_url, ping_interval=20, ping_timeout=20, close_timeout=5)
+            self._closed = False
+            self._recv_task = asyncio.create_task(self._recv_pump(), name="deriv-recv-pump")
             logger.info("Connected to Deriv", extra={"extra_fields": {"event_type": "ws_connected"}})
-
-    async def _open_socket(self) -> None:
-        """Exchanges a fresh (single-use) OTP and opens a new WebSocket
-        connection, replacing self._ws. Does not touch self._recv_task or
-        resubscribe anything -- callers (connect() for the very first
-        connection, _reconnect_and_resubscribe() for every one after) own
-        that."""
-        auth_url = await self._exchange_otp(self.account_id)
-        self._ws = await websockets.connect(auth_url, ping_interval=20, ping_timeout=20, close_timeout=5)
-        self._closed = False
-
-    async def _run_recv_pump_forever(self) -> None:
-        """Supervises _recv_pump(): whenever it exits -- a clean close or,
-        per this module's docstring point 3, a crash like
-        ConnectionClosedError -- the socket is dead and every live tick
-        subscription has silently stopped receiving pushes. Reconnects
-        (exponential backoff, capped at 30s) and resubscribes every tick
-        symbol before calling _recv_pump() again. Runs until close() sets
-        self._closed.
-
-        Deliberately does NOT create a new task or reassign self._recv_task
-        on each reconnect -- this coroutine already IS self._recv_task, and
-        cancelling/replacing it from inside itself would either self-cancel
-        the very loop trying to recover, or leave two supervisors racing to
-        read the same underlying socket. Reconnection happens in-place, in
-        the same long-lived task connect() spawned once.
-        """
-        backoff = 1.0
-        while not self._closed:
-            await self._recv_pump()  # logs its own error and returns; only CancelledError propagates
-            if self._closed:
-                return
-            logger.warning("Recv pump exited -- reconnecting", extra={"extra_fields": {
-                "event_type": "recv_pump_reconnect", "backoff_seconds": round(backoff, 1)}})
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
-            try:
-                await self._reconnect_and_resubscribe()
-                backoff = 1.0
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 -- a reconnect attempt failing must not kill the supervisor
-                logger.error("Reconnect after recv pump exit failed", exc_info=exc, extra={"extra_fields": {
-                    "event_type": "recv_pump_reconnect_failed"}})
 
     def _auth_headers(self) -> dict:
         return {"Deriv-App-ID": self.app_id, "Authorization": f"Bearer {self.api_token}"}
@@ -246,19 +180,7 @@ class DerivClient:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url, headers=self._auth_headers())
         if resp.status_code != 200:
-            # Include token diagnostics (never the token itself) so an
-            # expired/revoked token from Deriv is distinguishable in the
-            # logs from a locally malformed one (e.g. trailing
-            # newline/space pasted into the env var, which used to slip
-            # through silently before DerivConfig started stripping
-            # DERIV_APP_ID/DERIV_API_TOKEN).
-            token_len = len(self.api_token)
-            has_whitespace = self.api_token != self.api_token.strip()
-            raise DerivAuthError(
-                f"Fetching accounts failed: HTTP {resp.status_code} {resp.text[:300]} "
-                f"(token_len={token_len}, token_has_surrounding_whitespace={has_whitespace}, "
-                f"app_id={self.app_id!r})"
-            )
+            raise DerivAuthError(f"Fetching accounts failed: HTTP {resp.status_code} {resp.text[:300]}")
         body = resp.json()
         accounts = body.get("data") or body.get("accounts") or (body if isinstance(body, list) else [])
         if not accounts:
@@ -328,34 +250,17 @@ class DerivClient:
         # bound, so any environment installing a current version hits this.
         is_open = self._ws is not None and self._ws.state is WsState.OPEN
         if not is_open:
-            await self._reconnect_and_resubscribe()
-
-    async def _reconnect_and_resubscribe(self) -> None:
-        """Shared reconnect path for BOTH triggers: _run_recv_pump_forever()
-        noticing the pump itself died, and ensure_connected() noticing a
-        closed socket from an ordinary request (_send()) before the pump
-        has caught up. Whichever gets here first does the real work; the
-        other finds the socket already open under the lock and returns
-        immediately -- see the early-return check below."""
-        async with self._connect_lock:
-            if self._ws is not None and self._ws.state is WsState.OPEN:
-                return  # someone else already reconnected while this caller waited for the lock
             logger.warning("Reconnecting to Deriv", extra={"extra_fields": {"event_type": "ws_reconnect"}})
-            await self._open_socket()
-            # re-subscribe every symbol we were watching. Contract-update
-            # subscriptions are NOT resubscribed here deliberately --
-            # wait_for_contract_settlement()'s own bounded timeout + finally
-            # already handles a subscription silently going quiet (returns
-            # whatever partial state it has, or {} on timeout, which callers
-            # already treat as an unknown/cancel-worthy outcome), so there's
-            # no permanent-outage risk there the way there is for ticks.
-            for symbol in list(self._tick_queues.keys()):
+            await self.connect()
+            # re-subscribe any symbols we were watching
+            for symbol in list(self._subscription_ids.keys()):
                 self._subscription_ids.pop(symbol, None)
-                try:
-                    await self._send_subscribe_request(symbol)
-                except Exception as exc:  # noqa: BLE001 -- one symbol failing to resubscribe must not block the rest
-                    logger.error("Failed to resubscribe ticks after reconnect", exc_info=exc,
-                                 extra={"extra_fields": {"symbol": symbol, "event_type": "resubscribe_failed"}})
+                await self._resubscribe(symbol)
+
+    async def _resubscribe(self, symbol: str) -> None:
+        queue = self._tick_queues.get(symbol)
+        if queue is not None:
+            await self._send_subscribe_request(symbol)
 
     # ------------------------------------------------------------------ #
     # Low-level request/response
