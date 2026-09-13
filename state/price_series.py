@@ -26,6 +26,13 @@ class PriceSeries:
     prices: deque = field(default_factory=deque)           # raw quotes, tick resolution
     tick_log_returns: deque = field(default_factory=deque)
     minute_log_returns: deque = field(default_factory=deque)
+    # Minute-bar CLOSE prices, one appended per minute_log_returns append
+    # (same event, same index alignment). Added for signal models that
+    # need the actual minute-resolution price series, not just its
+    # log-returns (models/ou_zscore.py, models/kalman_trend.py) -- without
+    # this, a caller would have to reach into _last_minute_close, a
+    # private field that only ever holds the SINGLE most recent close.
+    minute_closes: deque = field(default_factory=deque)
 
     _minute_bucket_start: int | None = field(default=None, repr=False)
     _minute_bucket_last_price: float | None = field(default=None, repr=False)
@@ -35,6 +42,7 @@ class PriceSeries:
         self.prices = deque(self.prices, maxlen=self.max_tick_window)
         self.tick_log_returns = deque(self.tick_log_returns, maxlen=self.max_tick_window)
         self.minute_log_returns = deque(self.minute_log_returns, maxlen=self.max_minute_window)
+        self.minute_closes = deque(self.minute_closes, maxlen=self.max_minute_window)
 
     def push(self, epoch: int, price: float) -> None:
         if price <= 0:
@@ -62,6 +70,7 @@ class PriceSeries:
         close = self._minute_bucket_last_price
         if self._last_minute_close is not None and self._last_minute_close > 0 and close and close > 0:
             self.minute_log_returns.append(math.log(close / self._last_minute_close))
+            self.minute_closes.append(close)
         self._last_minute_close = close
         self._minute_bucket_start = bucket
         self._minute_bucket_last_price = price
