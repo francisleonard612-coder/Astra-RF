@@ -175,6 +175,19 @@ class AstraConfig:
             float(_env_max_stake) if _env_max_stake not in (None, "") else staking_yaml.get("max_stake")
         )
 
+        self.raw["rise_fall"]["conviction_shadow_only"] = _env_bool(
+            "RISE_FALL_CONVICTION_SHADOW_ONLY", rf_yaml.get("conviction_shadow_only", True))
+        self.raw["rise_fall"]["conviction_min_voters"] = _env_int(
+            "RISE_FALL_CONVICTION_MIN_VOTERS", rf_yaml.get("conviction_min_voters", 3))
+        self.raw["rise_fall"]["conviction_floor"] = _env_float(
+            "RISE_FALL_CONVICTION_FLOOR", rf_yaml.get("conviction_floor", 0.20))
+        self.raw["rise_fall"]["conviction_min_mult"] = _env_float(
+            "RISE_FALL_CONVICTION_MIN_MULT", rf_yaml.get("conviction_min_mult", 0.5))
+        self.raw["rise_fall"]["conviction_max_mult"] = _env_float(
+            "RISE_FALL_CONVICTION_MAX_MULT", rf_yaml.get("conviction_max_mult", 3.0))
+        self.raw["rise_fall"]["conviction_max_stake"] = _env_float(
+            "RISE_FALL_CONVICTION_MAX_STAKE", rf_yaml.get("conviction_max_stake", 0.0))
+
         # See DerivConfig.use_real_account docstring above for how this
         # combines with account type to give four distinct modes.
         self.dry_run: bool = _env_bool("DRY_RUN", False)

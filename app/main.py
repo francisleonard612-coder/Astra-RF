@@ -151,6 +151,10 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
                 "calibrated_probability": decision.calibrated_probability,
                 "drift_degraded": decision.drift_degraded,
                 "is_calibration_probe": decision.is_calibration_probe,
+                "layer_votes": decision.layer_votes,
+                "conviction": decision.conviction,
+                "conviction_direction": decision.conviction_direction,
+                "conviction_applied": decision.conviction_applied,
             }})
             intent = intent_from_rise_fall_decision(decision, currency)
             if intent is None:
@@ -364,6 +368,25 @@ async def main() -> None:
             staking_max_steps=staking_cfg.get("max_steps", 4),
             staking_max_stake=staking_cfg.get("max_stake"),
             staking_min_consecutive_losses=staking_cfg.get("min_consecutive_losses", 2),
+            # Multi-layer conviction voting (decision/regime_conviction.py,
+            # wired in via decision/rise_fall_decision_engine.py's
+            # "MULTI-LAYER VOTING"). conviction_shadow_only=True (the
+            # default): conviction is computed and persisted to
+            # astra_trades on every trade but never gates direction or
+            # sizes stake -- current MC/calibration/edge behavior is
+            # completely unchanged. This is an overnight SHADOW
+            # OBSERVATION run -- RF_REGIME_LAYERS (that module) is labeled
+            # "a STARTING HYPOTHESIS, not a validated mapping" in its own
+            # docstring, and the plan is to run decision/regime_
+            # conviction.py's conviction_outcome_report() against the
+            # accumulated data in the morning before ever considering
+            # conviction_shadow_only=False.
+            conviction_shadow_only=rf_cfg.get("conviction_shadow_only", True),
+            conviction_min_voters=rf_cfg.get("conviction_min_voters", 3),
+            conviction_floor=rf_cfg.get("conviction_floor", 0.20),
+            conviction_min_mult=rf_cfg.get("conviction_min_mult", 0.5),
+            conviction_max_mult=rf_cfg.get("conviction_max_mult", 3.0),
+            conviction_max_stake=rf_cfg.get("conviction_max_stake", 0.0),
         )
 
     # Fetch history ONCE per symbol -- feeds BOTH PriceSeries seeding
