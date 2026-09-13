@@ -39,8 +39,8 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass
 class DerivConfig:
-    app_id: str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089").strip())
-    api_token: str = field(default_factory=lambda: os.getenv("DERIV_API_TOKEN", "").strip())
+    app_id: str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089"))
+    api_token: str = field(default_factory=lambda: os.getenv("DERIV_API_TOKEN", ""))
     # Legacy WS host, only used as a last-resort fallback if Deriv's OTP response
     # ever omits the ready-to-use websocket URL (see DerivClient._exchange_otp).
     ws_url: str = field(default_factory=lambda: os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/demo"))
@@ -147,6 +147,18 @@ class AstraConfig:
             _env_warm_start_dir if _env_warm_start_dir not in (None, "")
             else rf_yaml.get("calibration_warm_start_dir")
         )
+        self.raw["rise_fall"]["calibration_warm_start_auto_generate"] = _env_bool(
+            "RISE_FALL_CALIBRATION_WARM_START_AUTO_GENERATE",
+            rf_yaml.get("calibration_warm_start_auto_generate", False))
+        self.raw["rise_fall"]["calibration_warm_start_auto_generate_count"] = _env_int(
+            "RISE_FALL_CALIBRATION_WARM_START_AUTO_GENERATE_COUNT",
+            rf_yaml.get("calibration_warm_start_auto_generate_count", 5000))
+        self.raw["rise_fall"]["calibration_warm_start_auto_generate_n_sims"] = _env_int(
+            "RISE_FALL_CALIBRATION_WARM_START_AUTO_GENERATE_N_SIMS",
+            rf_yaml.get("calibration_warm_start_auto_generate_n_sims", 2000))
+        self.raw["rise_fall"]["calibration_warm_start_auto_generate_sample_every"] = _env_int(
+            "RISE_FALL_CALIBRATION_WARM_START_AUTO_GENERATE_SAMPLE_EVERY",
+            rf_yaml.get("calibration_warm_start_auto_generate_sample_every", 5))
         self.raw["rise_fall"].setdefault("staking", {})
         self.raw["rise_fall"]["staking"]["enabled"] = _env_bool(
             "RISE_FALL_MARTINGALE_ENABLED", staking_yaml.get("enabled", False))

@@ -21,8 +21,8 @@ this build -- see app/logging_setup.py.
 from __future__ import annotations
 
 import asyncio
-import os
 import signal
+import time
 
 from app.config import get_config
 from app.logging_setup import configure_logging, get_logger
@@ -36,8 +36,7 @@ from pricing.contracts import FALL, RISE
 from pricing.duration_grid import build_candidate_grid, filter_to_allowed
 from pricing.monte_carlo_duration import DEFAULT_MC_SIMULATIONS
 from research.calibration_warmstart import (
-    apply_samples_to_pipeline, extract_samples_from_pipeline, jsonable_to_samples,
-    load_samples_json, samples_to_jsonable,
+    extract_samples_from_pipeline, restore_or_generate_calibration, samples_to_jsonable,
 )
 from risk.risk_engine import RiskEngine
 
@@ -266,7 +265,12 @@ async def discover_symbols(client: DerivClient, cfg) -> list[str]:
     return symbols
 
 
-async def seed_symbol(client: DerivClient, pipeline: RiseFallSymbolPipeline, count: int = 2000) -> None:
+async def seed_symbol(client: DerivClient, pipeline: RiseFallSymbolPipeline, count: int = 2000) -> list[tuple[int, float]]:
+    """Returns the raw (epoch, price) ticks it seeded PriceSeries from, so a
+    caller (see main()'s calibration auto-generate step) can reuse the same
+    fetch instead of hitting client.get_history() a second time. Returns []
+    on failure -- callers must treat that as "no history available", not
+    raise."""
     try:
         history = await client.get_history(pipeline.symbol, count=count)
         for t in history:
@@ -276,9 +280,11 @@ async def seed_symbol(client: DerivClient, pipeline: RiseFallSymbolPipeline, cou
             "tick_returns": len(pipeline.price_series.tick_log_returns),
             "minute_returns": len(pipeline.price_series.minute_log_returns),
         }})
+        return [(t.epoch, t.quote) for t in history]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Seeding failed, will build history from live ticks only",
                         extra={"extra_fields": {"symbol": pipeline.symbol, "error": str(exc)}})
+        return []
 
 
 async def main() -> None:
@@ -360,41 +366,85 @@ async def main() -> None:
             staking_min_consecutive_losses=staking_cfg.get("min_consecutive_losses", 2),
         )
 
-    # Restore calibration state, in priority order:
+    # Fetch history ONCE per symbol -- feeds BOTH PriceSeries seeding
+    # (always) and, if needed, calibration auto-generation below (only for
+    # a symbol with no restorable state yet). One fetch, two uses, instead
+    # of a second Deriv API round-trip. count is bumped when auto-generate
+    # is enabled, since a meaningful minute-resolution replay needs
+    # noticeably more raw ticks than PriceSeries alone would ask for.
+    auto_generate = rf_cfg.get("calibration_warm_start_auto_generate", False)
+    seed_count = rf_cfg.get("calibration_warm_start_auto_generate_count", 5000) if auto_generate else 2000
+    history_by_symbol: dict[str, list[tuple[int, float]]] = {}
+
+    async def _seed(symbol: str, pipeline: RiseFallSymbolPipeline) -> None:
+        history_by_symbol[symbol] = await seed_symbol(client, pipeline, count=seed_count)
+
+    await asyncio.gather(*[_seed(symbol, pipelines[symbol]) for symbol in symbols])
+
+    # Restore calibration state, in priority order -- so every symbol's
+    # worker begins its FIRST live evaluate() already at whatever warm
+    # state is available, rather than warming up gradually during live
+    # trading:
     #   1. Supabase (astra_rise_fall_calibration_state) -- the bot's OWN
     #      continuously-updated state from every previous settlement (see
     #      _on_settled below, which saves here after every trade). This is
-    #      what actually survives a Railway restart/redeploy day to day.
+    #      what actually survives a Railway restart/redeploy day to day,
+    #      and loading it is near-instant (just replaying stored pairs
+    #      through .record(), no MC simulation).
     #   2. The one-off file-based warm-start (calibration_warm_start_dir,
     #      research/calibration_warmstart.py / backtest/warm_start_
-    #      calibration.py) -- only useful the very FIRST time, before
-    #      Supabase has anything for this symbol yet, to seed from history
-    #      that predates the bot ever running.
-    # Either is optional; a symbol with neither just starts cold, same as
-    # before either existed.
+    #      calibration.py) -- for history that predates the bot ever
+    #      running, or a manually-curated batch.
+    #   3. Auto-generate (calibration_warm_start_auto_generate, opt-in, off
+    #      by default) -- if NEITHER of the above had anything, replay the
+    #      history batch already fetched above through the same MC call
+    #      evaluate() itself uses, right now, before this symbol's worker
+    #      starts. Saved to Supabase immediately afterward, so this is a
+    #      ONE-TIME cost per symbol: every later restart hits step 1
+    #      instead. This is genuinely CPU-bound (thousands of MC
+    #      simulations) and runs in a thread (asyncio.to_thread), not
+    #      inline on the event loop -- blocking the loop here for the
+    #      seconds-to-minutes this can take would stall the recv-pump's
+    #      ping/pong keepalive and risk tripping the exact "no close frame"
+    #      disconnect ingestion/deriv_client.py's reconnect supervisor
+    #      exists to recover from (see that module's docstring point 3) --
+    #      recovering from a self-inflicted disconnect is a worse outcome
+    #      than just taking the thread-hop here.
+    #   4. Nothing available anywhere -- starts cold, same as before any of
+    #      this existed.
     warm_start_dir = rf_cfg.get("calibration_warm_start_dir")
-    for symbol, pipeline in pipelines.items():
-        supabase_state = repo.load_rise_fall_calibration_state(symbol)
-        if supabase_state:
-            applied = apply_samples_to_pipeline(pipeline, jsonable_to_samples(supabase_state))
-            logger.info("Restored calibration state from Supabase",
-                        extra={"extra_fields": {"symbol": symbol, "applied": applied}})
-            continue  # Supabase state found -- the file-based warm-start would be redundant/stale on top of it
-        if not warm_start_dir:
-            continue
-        path = os.path.join(warm_start_dir, f"{symbol}.json")
-        if not os.path.exists(path):
-            logger.info("No calibration state in Supabase or warm-start file for symbol",
-                        extra={"extra_fields": {"symbol": symbol, "path": path}})
-            continue
-        try:
-            samples = load_samples_json(path)
-            applied = apply_samples_to_pipeline(pipeline, samples)
-            logger.info("Loaded calibration warm-start from file",
-                        extra={"extra_fields": {"symbol": symbol, "path": path, "applied": applied}})
-        except Exception as exc:  # noqa: BLE001 -- a bad/missing warm-start file must never block startup
-            logger.warning("Calibration warm-start load failed",
-                            extra={"extra_fields": {"symbol": symbol, "path": path, "error": str(exc)}})
+    tick_candidate_durations = cfg.get("contracts", "rise_fall", "candidate_tick_durations",
+                                        default=[5, 10, 15, 20, 30])
+    minute_candidate_durations = cfg.get("contracts", "rise_fall", "candidate_minute_durations",
+                                          default=[1, 2, 3, 5, 10])
+
+    async def _restore_or_generate_calibration(symbol: str, pipeline: RiseFallSymbolPipeline) -> None:
+        t0 = time.monotonic()
+        outcome, applied = await restore_or_generate_calibration(
+            repo, pipeline, symbol,
+            warm_start_dir=warm_start_dir,
+            ticks=history_by_symbol.get(symbol) or [],
+            tick_candidate_durations=tick_candidate_durations,
+            minute_candidate_durations=minute_candidate_durations,
+            auto_generate=auto_generate,
+            n_sims=rf_cfg.get("calibration_warm_start_auto_generate_n_sims", 2000),
+            sample_every=rf_cfg.get("calibration_warm_start_auto_generate_sample_every", 5),
+            on_file_error=lambda path, exc: logger.warning(
+                "Calibration warm-start load failed",
+                extra={"extra_fields": {"symbol": symbol, "path": path, "error": str(exc)}}),
+        )
+        message = {
+            "supabase": "Restored calibration state from Supabase",
+            "file": "Loaded calibration warm-start from file",
+            "auto_generated": "Auto-generated calibration warm-start",
+            "cold": "No calibration state available for symbol -- starting cold",
+        }[outcome]
+        fields = {"symbol": symbol, "applied": applied}
+        if outcome == "auto_generated":
+            fields["seconds"] = round(time.monotonic() - t0, 1)
+        logger.info(message, extra={"extra_fields": fields})
+
+    await asyncio.gather(*[_restore_or_generate_calibration(symbol, pipelines[symbol]) for symbol in symbols])
 
     # Martingale progression state -- NOT restored by default even when
     # martingale itself is enabled. See risk/staking.py's StakingEngine
@@ -413,9 +463,6 @@ async def main() -> None:
                     "symbol": symbol, "step": staking_state.get("step", 0),
                     "consecutive_losses": staking_state.get("consecutive_losses", 0),
                 }})
-
-    seed_tasks = [seed_symbol(client, p) for p in pipelines.values()]
-    await asyncio.gather(*seed_tasks)
 
     workers = []
     for symbol in symbols:
