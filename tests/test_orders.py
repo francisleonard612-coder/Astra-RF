@@ -200,7 +200,7 @@ def test_shutdown_waits_for_pending_settlements_then_cancels_stragglers():
 
 class _FakeRiseFallDecision:
     def __init__(self, decision, stake, quote, contract_type=RISE, duration=5, duration_unit="t",
-                 symbol="1HZ10V"):
+                 symbol="1HZ10V", conviction=None, conviction_direction=None, layer_votes=None):
         self.decision = decision
         self.stake = stake
         self.quote = quote
@@ -208,12 +208,22 @@ class _FakeRiseFallDecision:
         self.duration = duration
         self.duration_unit = duration_unit
         self.symbol = symbol
+        # Conviction fields (decision/rise_fall_decision_engine.py's
+        # "MULTI-LAYER VOTING") -- default None/None/None, matching a
+        # decision made before conviction voting existed, or a probe
+        # candidate (which never carries conviction). Tests that care about
+        # these can override them explicitly.
+        self.conviction = conviction
+        self.conviction_direction = conviction_direction
+        self.layer_votes = layer_votes
 
 
 def test_intent_from_rise_fall_decision_builds_a_matching_intent():
     quote = ContractQuote(symbol="1HZ10V", contract_type=RISE, barrier=None, stake=2.0,
                            payout=4.0, ask_price=2.0, proposal_id="p1", spot=100.0)
-    decision = _FakeRiseFallDecision("TRADE_RISE", stake=2.0, quote=quote)
+    decision = _FakeRiseFallDecision("TRADE_RISE", stake=2.0, quote=quote,
+                                      conviction=0.62, conviction_direction=1,
+                                      layer_votes={"tick_markov": 0.4})
 
     intent = intent_from_rise_fall_decision(decision, currency="USD")
 
@@ -226,6 +236,9 @@ def test_intent_from_rise_fall_decision_builds_a_matching_intent():
     assert intent.currency == "USD"
     assert intent.barrier is None
     assert intent.quote is quote
+    assert intent.conviction == 0.62
+    assert intent.conviction_direction == 1
+    assert intent.layer_votes == {"tick_markov": 0.4}
 
 
 def test_intent_from_rise_fall_decision_none_on_no_trade():
@@ -236,3 +249,107 @@ def test_intent_from_rise_fall_decision_none_on_no_trade():
 def test_intent_from_rise_fall_decision_none_without_a_quote():
     decision = _FakeRiseFallDecision("TRADE_RISE", stake=2.0, quote=None)
     assert intent_from_rise_fall_decision(decision, currency="USD") is None
+
+
+def test_conviction_fields_survive_intent_through_to_the_settled_result():
+    """End-to-end: conviction/conviction_direction/layer_votes set on a
+    TradeIntent must ride along through the entire settlement flow (the
+    immediate pending TradeResult AND the final settled one persisted by
+    _watch_and_finalize) -- this is what decision/regime_conviction.py's
+    conviction_outcome_report() needs present on completed astra_trades
+    rows to check conviction against real win/loss outcomes."""
+    _reset_payout_module_state()
+
+    async def run():
+        client = FakeDerivClient(payout=2.0, contract_id=42, profit=1.5, is_sold=True)
+        repo = FakeRepo()
+        risk_engine = _risk_engine()
+        executor = OrderExecutor(client, repo, risk_engine, dry_run=False)
+        intent = _intent(conviction=0.71, conviction_direction=1, layer_votes={"kalman_trend": 0.5})
+
+        risk_engine.reserve_trade_slot()
+        immediate = await executor.place_trade(intent, prediction_id=1)
+        assert immediate.conviction == 0.71
+        assert immediate.conviction_direction == 1
+        assert immediate.layer_votes == {"kalman_trend": 0.5}
+
+        await list(executor._pending_tasks)[0]  # force settlement
+
+        settled_result, _ = repo.inserted[-1]
+        assert settled_result.won is True
+        assert settled_result.conviction == 0.71
+        assert settled_result.conviction_direction == 1
+        assert settled_result.layer_votes == {"kalman_trend": 0.5}
+
+    asyncio.run(run())
+
+
+def test_conviction_fields_default_to_none_for_digit_trades():
+    """intent_from_digit_decision never sets these -- TradeIntent's
+    defaults must make that a genuine no-op, not an error, for the digit
+    decision engine's existing, unrelated call path."""
+    intent = _intent()
+    assert intent.conviction is None
+    assert intent.conviction_direction is None
+    assert intent.layer_votes is None
+
+
+class _FakeInsertTable:
+    def __init__(self, store: list):
+        self._store = store
+
+    def insert(self, row):
+        self._row = row
+        return self
+
+    def execute(self):
+        self._store.append(self._row)
+        return self._row
+
+
+class _FakeSupabaseClientForInsert:
+    def __init__(self):
+        self.rows: list = []
+
+    def table(self, _name):
+        return _FakeInsertTable(self.rows)
+
+
+def test_repository_insert_trade_persists_conviction_fields():
+    """database/repository.py's insert_trade must carry conviction/
+    conviction_direction/layer_votes into the row it sends to Supabase --
+    without this, TradeResult can have them, but astra_trades never would,
+    and conviction_outcome_report() would have nothing to read."""
+    from database.repository import Repository
+    from execution.orders import TradeResult
+
+    client = _FakeSupabaseClientForInsert()
+    repo = Repository(client=client)
+    result = TradeResult(symbol="R_100", contract_type=RISE, barrier=None, stake=1.0, payout=2.0,
+                          contract_id=42, won=True, pnl=1.0, error=None,
+                          conviction=0.55, conviction_direction=1, layer_votes={"ou_zscore": -0.2})
+
+    repo.insert_trade(result, prediction_id=None)
+
+    assert len(client.rows) == 1
+    row = client.rows[0]
+    assert row["conviction"] == 0.55
+    assert row["conviction_direction"] == 1
+    assert row["layer_votes"] == {"ou_zscore": -0.2}
+
+
+def test_repository_insert_trade_conviction_fields_default_to_none():
+    from database.repository import Repository
+    from execution.orders import TradeResult
+
+    client = _FakeSupabaseClientForInsert()
+    repo = Repository(client=client)
+    result = TradeResult(symbol="R_100", contract_type=RISE, barrier=None, stake=1.0, payout=2.0,
+                          contract_id=42, won=False, pnl=-1.0, error=None)
+
+    repo.insert_trade(result, prediction_id=None)
+
+    row = client.rows[0]
+    assert row["conviction"] is None
+    assert row["conviction_direction"] is None
+    assert row["layer_votes"] is None
