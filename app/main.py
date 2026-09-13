@@ -147,9 +147,11 @@ async def symbol_worker(symbol: str, client: DerivClient, pipeline: RiseFallSymb
             log.info("Executing trade", extra={"extra_fields": {
                 "decision": decision.decision, "reason": decision.reason, "regime": decision.regime,
                 "edge": decision.edge, "duration": f"{decision.duration}{decision.duration_unit}",
+                "stake": decision.stake,
                 "mc_win_probability": decision.mc_win_probability,
                 "calibrated_probability": decision.calibrated_probability,
                 "drift_degraded": decision.drift_degraded,
+                "is_calibration_probe": decision.is_calibration_probe,
             }})
             intent = intent_from_rise_fall_decision(decision, currency)
             if intent is None:
@@ -344,6 +346,10 @@ async def main() -> None:
             # GATE"). 0.0 disables it -- see that docstring for why this is
             # off by default.
             min_calibration_quality=rf_cfg.get("min_calibration_quality", 0.0),
+            # Probe-trade escape hatch for the lockout the quality gate
+            # above would otherwise create -- see "PROBE TRADES" docstring.
+            # 0 disables probing (permanent lockout once blocked).
+            calibration_quality_probe_interval=rf_cfg.get("calibration_quality_probe_interval", 50),
             # Martingale staking -- opt-in, off by default (see
             # decision/rise_fall_decision_engine.py's "MARTINGALE STAKING"
             # and risk/staking.py's own documented warning).

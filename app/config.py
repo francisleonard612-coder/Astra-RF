@@ -140,6 +140,8 @@ class AstraConfig:
             "RISE_FALL_MIN_CONFIDENCE", rf_yaml.get("min_confidence", 0.70))
         self.raw["rise_fall"]["min_calibration_quality"] = _env_float(
             "RISE_FALL_MIN_CALIBRATION_QUALITY", rf_yaml.get("min_calibration_quality", 0.0))
+        self.raw["rise_fall"]["calibration_quality_probe_interval"] = _env_int(
+            "RISE_FALL_CALIBRATION_QUALITY_PROBE_INTERVAL", rf_yaml.get("calibration_quality_probe_interval", 50))
         _env_warm_start_dir = os.getenv("RISE_FALL_CALIBRATION_WARM_START_DIR")
         self.raw["rise_fall"]["calibration_warm_start_dir"] = (
             _env_warm_start_dir if _env_warm_start_dir not in (None, "")
