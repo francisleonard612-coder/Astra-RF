@@ -103,6 +103,34 @@ rise_fall:
   # WARM-START" and research/calibration_warmstart.py.
   calibration_warm_start_dir: null
 
+  # AUTO-GENERATE (opt-in, off by default): if true, and a symbol has NO
+  # restorable calibration state in Supabase or the warm-start file above,
+  # app/main.py automatically runs the same historical-tick replay
+  # (research/calibration_warmstart.py's build_calibration_samples())
+  # using the SAME history batch already fetched to seed PriceSeries at
+  # startup -- no separate CLI run needed, and the bot begins trading
+  # already at a warm calibration state rather than warming up gradually
+  # via live trades. Saved to Supabase immediately afterward, so this is a
+  # ONE-TIME cost per symbol -- every later restart just loads the saved
+  # result (near-instant) instead of re-running the replay. This IS
+  # CPU-bound and IS run off the event loop thread (see app/main.py's
+  # asyncio.to_thread usage), but still adds real wall-clock time to
+  # startup -- expect anywhere from single-digit seconds to a couple of
+  # minutes depending on the settings below and how many symbols need it
+  # simultaneously.
+  calibration_warm_start_auto_generate: false
+  # Historical ticks fetched per symbol when auto-generate triggers --
+  # replaces the smaller default PriceSeries-only seed count so there's
+  # enough history for a meaningful minute-resolution replay too.
+  calibration_warm_start_auto_generate_count: 5000
+  # MC simulations per candidate during the replay -- deliberately lower
+  # than live mc_simulations above; see backtest/warm_start_calibration.py.
+  calibration_warm_start_auto_generate_n_sims: 2000
+  # Cost control -- only replay every Nth valid tick position, not every
+  # one. See research/calibration_warmstart.py's build_calibration_samples()
+  # docstring.
+  calibration_warm_start_auto_generate_sample_every: 5
+
   # Martingale staking for Rise/Fall, routed through risk/staking.py's
   # StakingEngine (self.staking on RiseFallSymbolPipeline). OFF by default,
   # deliberately, same reasoning as risk.staking below: a sibling bot ran
