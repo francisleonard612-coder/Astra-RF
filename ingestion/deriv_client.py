@@ -246,7 +246,19 @@ class DerivClient:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url, headers=self._auth_headers())
         if resp.status_code != 200:
-            raise DerivAuthError(f"Fetching accounts failed: HTTP {resp.status_code} {resp.text[:300]}")
+            # Include token diagnostics (never the token itself) so an
+            # expired/revoked token from Deriv is distinguishable in the
+            # logs from a locally malformed one (e.g. trailing
+            # newline/space pasted into the env var, which used to slip
+            # through silently before DerivConfig started stripping
+            # DERIV_APP_ID/DERIV_API_TOKEN).
+            token_len = len(self.api_token)
+            has_whitespace = self.api_token != self.api_token.strip()
+            raise DerivAuthError(
+                f"Fetching accounts failed: HTTP {resp.status_code} {resp.text[:300]} "
+                f"(token_len={token_len}, token_has_surrounding_whitespace={has_whitespace}, "
+                f"app_id={self.app_id!r})"
+            )
         body = resp.json()
         accounts = body.get("data") or body.get("accounts") or (body if isinstance(body, list) else [])
         if not accounts:
