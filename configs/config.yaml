@@ -77,6 +77,22 @@ rise_fall:
   # See decision/rise_fall_decision_engine.py's "CALIBRATION-QUALITY GATE".
   min_calibration_quality: 0.0
 
+  # PROBE TRADES: fixes a lockout min_calibration_quality above would
+  # otherwise create -- a candidate blocked by the quality gate never gets
+  # a real quote, never settles, and therefore never gets a fresh sample
+  # to improve its quality_score(), which without this would be a
+  # PERMANENT lock (fixable only from outside, e.g. a calibration
+  # warm-start/Supabase restore overwriting its buffer). Once a
+  # (contract_type, resolution) candidate has been blocked this many
+  # consecutive cycles, the next one is let through past the quality gate
+  # ONLY -- min_edge and min_confidence above still apply in full, so a
+  # probe still has to look genuinely tradeable by every other measure.
+  # Its stake is also forced to base_stake regardless of martingale
+  # escalation. 0 disables probing entirely (the original permanent-
+  # lockout behavior). See decision/rise_fall_decision_engine.py's
+  # "PROBE TRADES" docstring.
+  calibration_quality_probe_interval: 50
+
   # CALIBRATION WARM-START: if set, app/main.py loads
   # {this_dir}/{symbol}.json at startup (produced by
   # `python -m backtest.warm_start_calibration --symbols ...`) and replays
