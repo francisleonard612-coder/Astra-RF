@@ -47,31 +47,25 @@ Two hard lessons from earlier bots in this account are baked in here:
    restart. `_run_recv_pump_forever()` (spawned by `connect()` instead of
    `_recv_pump` directly) supervises this: whenever `_recv_pump()` exits for
    any reason, it reconnects (backing off up to 30s between attempts) and
-   resubscribes every live tick symbol.
+   resubscribes every live tick symbol before resuming the pump. This lives
+   OUTSIDE `_recv_pump()` itself -- the reconnect only ever runs after the
+   pump has already returned, never from within its loop -- so it doesn't
+   violate rule 2 above.
 
-4. RESUBSCRIBE MUST RUN CONCURRENTLY WITH THE PUMP, NOT BEFORE IT: an
-   earlier version of point 3's fix opened the new socket and then ran the
-   whole resubscribe loop BEFORE starting a fresh `_recv_pump()` for it --
-   "resubscribe, then resume the pump". That ordering is broken: every
-   resubscribe request goes through `_send()`, which sends on the socket
-   and then `await`s a response future that only `_recv_pump()` ever
-   resolves (see rule 2). With no pump running yet, nothing was ever going
-   to read that response, so EVERY resubscribe after EVERY reconnect was
-   guaranteed to hang until `request_timeout` -- not a flaky occasional
-   failure, a deterministic one, for every symbol, every time. Confirmed
-   against a real production log: a clean OTP re-auth immediately followed
-   by a burst of "Failed to resubscribe ticks after reconnect" timeouts
-   spaced ~`request_timeout` apart, one per symbol, with nothing about the
-   socket itself failing in between. Fixed by starting the new
-   `_recv_pump()` (tracked in `self._pump_task`) immediately after
-   `_open_socket()`, BEFORE the resubscribe loop runs, so it's already
-   reading the socket and can resolve each subscribe response as it
-   arrives. `_run_recv_pump_forever()` now awaits `self._pump_task` (the
-   currently-live pump, whichever `_reconnect_and_resubscribe()` most
-   recently started) instead of calling `_recv_pump()` itself, so there is
-   still only ever one coroutine reading the socket at a time -- this does
-   not reopen rule 2's self-deadlock, it just changes who starts the pump
-   and when.
+   A follow-on bug from the same fix: `_reconnect_and_resubscribe()` used to
+   open the new socket and immediately start sending `{"ticks": ..., "subscribe":
+   1}` resubscribe requests through `_send()`, which blocks on a per-req_id
+   `asyncio.Future` that only `_recv_pump()` ever resolves. But
+   `_run_recv_pump_forever()` doesn't call `_recv_pump()` again until
+   `_reconnect_and_resubscribe()` returns -- so nothing was reading the new
+   socket while the resubscribes waited for their responses. Every resubscribe
+   after a reconnect hung for the full `request_timeout` and failed with
+   `TimeoutError` ("Failed to resubscribe ticks after reconnect"), leaving the
+   symbol permanently unsubscribed even though the reconnect itself succeeded.
+   Fix: `_reconnect_and_resubscribe()` now starts the pump reading the new
+   socket (`self._pump_task = asyncio.create_task(self._recv_pump())`)
+   *before* sending any resubscribe request, and `_run_recv_pump_forever()`
+   awaits that same task instead of re-invoking `_recv_pump()` itself.
 """
 from __future__ import annotations
 
@@ -179,11 +173,6 @@ class DerivClient:
         self._contract_queues: dict[int, asyncio.Queue] = {}
         self._contract_subscription_ids: dict[int, str] = {}  # contract_id -> deriv subscription id
         self._recv_task: asyncio.Task | None = None
-        # The actual currently-live `_recv_pump()` task -- whichever socket
-        # is current. `_run_recv_pump_forever()` awaits THIS (not a direct
-        # `_recv_pump()` call) so it always tracks whatever
-        # `_reconnect_and_resubscribe()` most recently started. See this
-        # module's docstring point 4.
         self._pump_task: asyncio.Task | None = None
         self._closed = False
         self._connect_lock = asyncio.Lock()
@@ -200,17 +189,13 @@ class DerivClient:
                     "wanted": "real" if self.use_real_account else "demo",
                 }})
             await self._open_socket()
-            # The actual socket reader -- see docstring point 4 for why this
-            # is a separate task from the supervisor below, started here
-            # (and again inside _reconnect_and_resubscribe() on every later
-            # reconnect) rather than left for the supervisor to start.
-            self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-recv-pump-inner")
+            self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-recv-pump")
             # ONE long-lived supervisor task for the whole life of this
             # client, not re-spawned on every reconnect -- see this module's
             # docstring point 3 and _run_recv_pump_forever()'s own docstring
             # for why a fresh task per reconnect would risk two supervisors
             # racing to read the same (or a just-replaced) socket.
-            self._recv_task = asyncio.create_task(self._run_recv_pump_forever(), name="deriv-recv-pump")
+            self._recv_task = asyncio.create_task(self._run_recv_pump_forever(), name="deriv-recv-pump-supervisor")
             logger.info("Connected to Deriv", extra={"extra_fields": {"event_type": "ws_connected"}})
 
     async def _open_socket(self) -> None:
@@ -224,54 +209,38 @@ class DerivClient:
         self._closed = False
 
     async def _run_recv_pump_forever(self) -> None:
-        """Supervises the pump: whenever the currently-live `self._pump_task`
-        exits -- a clean close or, per this module's docstring point 3, a
-        crash like ConnectionClosedError -- the socket is dead and every
-        live tick subscription has silently stopped receiving pushes.
-        Reconnects (exponential backoff, capped at 30s), and each
-        reconnect attempt starts a FRESH `self._pump_task` and resubscribes
-        every tick symbol concurrently with it (see
-        `_reconnect_and_resubscribe()` and docstring point 4 for why that
-        ordering matters). Runs until close() sets self._closed.
+        """Supervises _recv_pump(): whenever it exits -- a clean close or,
+        per this module's docstring point 3, a crash like
+        ConnectionClosedError -- the socket is dead and every live tick
+        subscription has silently stopped receiving pushes. Reconnects
+        (exponential backoff, capped at 30s) and resubscribes every tick
+        symbol before calling _recv_pump() again. Runs until close() sets
+        self._closed.
 
         Deliberately does NOT create a new task or reassign self._recv_task
         on each reconnect -- this coroutine already IS self._recv_task, and
         cancelling/replacing it from inside itself would either self-cancel
         the very loop trying to recover, or leave two supervisors racing to
         read the same underlying socket. Reconnection happens in-place, in
-        the same long-lived task connect() spawned once. self._pump_task
-        (the actual socket reader) is a separate, shorter-lived task that
-        this supervisor merely awaits and replaces -- see docstring point 4.
+        the same long-lived task connect() spawned once.
         """
         backoff = 1.0
         while not self._closed:
-            try:
-                await self._pump_task  # logs its own error and returns; only CancelledError propagates
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 -- _recv_pump already logged the real cause
-                pass
+            await self._pump_task  # logs its own error and returns; only CancelledError propagates
             if self._closed:
                 return
             logger.warning("Recv pump exited -- reconnecting", extra={"extra_fields": {
                 "event_type": "recv_pump_reconnect", "backoff_seconds": round(backoff, 1)}})
-            # Retry _reconnect_and_resubscribe() (which opens the socket AND
-            # starts the next self._pump_task -- see docstring point 4) with
-            # backoff until it succeeds or the client is closed. Only once
-            # it succeeds is there a live self._pump_task worth awaiting
-            # again at the top of the outer loop.
-            while not self._closed:
-                await asyncio.sleep(backoff)
-                try:
-                    await self._reconnect_and_resubscribe()
-                    backoff = 1.0
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 -- a reconnect attempt failing must not kill the supervisor
-                    backoff = min(backoff * 2, 30.0)
-                    logger.error("Reconnect after recv pump exit failed", exc_info=exc, extra={"extra_fields": {
-                        "event_type": "recv_pump_reconnect_failed", "backoff_seconds": round(backoff, 1)}})
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+            try:
+                await self._reconnect_and_resubscribe()
+                backoff = 1.0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- a reconnect attempt failing must not kill the supervisor
+                logger.error("Reconnect after recv pump exit failed", exc_info=exc, extra={"extra_fields": {
+                    "event_type": "recv_pump_reconnect_failed"}})
 
     def _auth_headers(self) -> dict:
         return {"Deriv-App-ID": self.app_id, "Authorization": f"Bearer {self.api_token}"}
@@ -360,10 +329,10 @@ class DerivClient:
         self._closed = True
         for task in list(self._tick_workers.values()):
             task.cancel()
-        if self._pump_task:
-            self._pump_task.cancel()
         if self._recv_task:
             self._recv_task.cancel()
+        if self._pump_task:
+            self._pump_task.cancel()
         if self._ws is not None:
             await self._ws.close()
 
@@ -392,15 +361,18 @@ class DerivClient:
                 return  # someone else already reconnected while this caller waited for the lock
             logger.warning("Reconnecting to Deriv", extra={"extra_fields": {"event_type": "ws_reconnect"}})
             await self._open_socket()
-            # Start the pump on the NEW socket now, before resubscribing --
-            # see docstring point 4. _send_subscribe_request() below goes
-            # through _send(), which awaits a response future that only a
-            # running _recv_pump() ever resolves; starting the pump after
-            # this loop (as an earlier version did) meant nothing was ever
-            # reading the socket while every resubscribe request waited for
-            # a reply, so each one was guaranteed to hang until
-            # request_timeout, for every symbol, on every reconnect.
-            self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-recv-pump-inner")
+            # Start the pump reading the NEW socket now, before resubscribing.
+            # _send_subscribe_request() below goes through _send(), which
+            # blocks on a per-req_id asyncio.Future that only _recv_pump()
+            # resolves. _run_recv_pump_forever() doesn't await _recv_pump()
+            # again until this function returns, so if the pump isn't
+            # started here first, nothing is reading the new socket while
+            # we wait for the resubscribe responses -- every resubscribe
+            # would hang until _send()'s request_timeout and fail with
+            # TimeoutError (this is what produced "Failed to resubscribe
+            # ticks after reconnect" in production: the reconnect itself
+            # succeeded, but the resubscribe sends had no reader).
+            self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-recv-pump")
             # re-subscribe every symbol we were watching. Contract-update
             # subscriptions are NOT resubscribed here deliberately --
             # wait_for_contract_settlement()'s own bounded timeout + finally
