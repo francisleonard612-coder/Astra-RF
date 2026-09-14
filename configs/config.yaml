@@ -44,7 +44,7 @@ contracts:
 # ceiling).
 rise_fall:
   base_stake: 0.35
-  min_edge: 0.06
+  min_edge: 0.25
   min_calibration_samples: 500
   mc_simulations: 50000
   # See decision/rise_fall_decision_engine.py's "MULTIPLE-COMPARISONS
@@ -61,7 +61,7 @@ rise_fall:
   # independently exceed min_confidence -- on top of, not instead of,
   # min_edge above. See decision/rise_fall_decision_engine.py's "CONFIDENCE
   # GATE" docstring for why both are required.
-  min_confidence: 0.70
+  min_confidence: 0.85
 
   # CALIBRATION-QUALITY GATE: found from a live deployment log where every
   # "Executing trade" line showed mc_win_probability == calibrated_
@@ -118,7 +118,7 @@ rise_fall:
   # startup -- expect anywhere from single-digit seconds to a couple of
   # minutes depending on the settings below and how many symbols need it
   # simultaneously.
-  calibration_warm_start_auto_generate: false
+  calibration_warm_start_auto_generate: true
   # Historical ticks fetched per symbol when auto-generate triggers --
   # replaces the smaller default PriceSeries-only seed count so there's
   # enough history for a meaningful minute-resolution replay too.
@@ -142,7 +142,7 @@ rise_fall:
   # is still bounded by risk.max_stake below, which app/main.py checks
   # against the actual decision.stake for every trade.
   staking:
-    enabled: false
+    enabled: true
     # Whether martingale progression (step, consecutive_losses) survives a
     # Railway restart/redeploy, via astra_rise_fall_staking_state in
     # Supabase. Deliberately OFF even when staking.enabled is true: a
@@ -158,7 +158,7 @@ rise_fall:
                                 # losses -- one isolated loss alone leaves stake at
                                 # base_stake; the second consecutive loss is what first
                                 # escalates it. Set to 1 to escalate after every loss.
-    max_steps: 4               # resets to base_stake after this many consecutive escalations
+    max_steps: 5               # resets to base_stake after this many consecutive escalations
     max_stake: 5.0              # hard ceiling on the progression itself, independent of risk.max_stake
 
   # Multi-layer conviction voting (decision/regime_conviction.py, wired in
@@ -177,10 +177,10 @@ rise_fall:
   # before this is ever allowed to touch a real trade. Do not flip to false
   # until that report has been run and shows a real, non-flat, non-inverted
   # relationship -- see that function's own docstring for how to read it.
-  conviction_shadow_only: true
-  conviction_min_voters: 3     # minimum NON-ABSTAINING layers required for a regime's mapped set to
+  conviction_shadow_only: false
+  conviction_min_voters: 4     # minimum NON-ABSTAINING layers required for a regime's mapped set to
                                  # count as a consensus at all -- see compute_conviction()'s own docstring
-  conviction_floor: 0.20        # below this, conviction_stake() returns 0 (skip, not "trade small")
+  conviction_floor: 0.25        # below this, conviction_stake() returns 0 (skip, not "trade small")
   conviction_min_mult: 0.5      # stake multiplier at conviction == conviction_floor
   conviction_max_mult: 3.0      # stake multiplier at conviction == 1.0
   conviction_max_stake: 0.0     # absolute cap on conviction-scaled stake; 0 = uncapped (still bounded
@@ -189,7 +189,7 @@ rise_fall:
 
 feature_windows: [20, 50, 100, 250, 500, 1000, 2500]
 max_markov_order: 3
-min_samples_per_symbol: 300      # minimum digits observed before Astra will predict at all
+min_samples_per_symbol: 900      # minimum digits observed before Astra will predict at all
 
 risk:
   base_stake: 0.35
