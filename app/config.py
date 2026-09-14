@@ -199,6 +199,50 @@ class AstraConfig:
             [s.strip() for s in symbols_override.split(",") if s.strip()] if symbols_override else None
         )
 
+        # ----- ASTRA_DURATION_MODE: tick-only / minute-only / both -----
+        # This is a TRADING-DURATION switch, not a data-architecture switch.
+        # Astra's tick ingestion/observe/evaluate loop (app/main.py's
+        # symbol_worker), PriceSeries (state/price_series.py, which already
+        # tracks both tick_log_returns and minute_log_returns), and every
+        # model stay 100% unchanged and keep running exactly as before no
+        # matter what this is set to -- nothing about the tick architecture
+        # is removed or bypassed.
+        #
+        # What it DOES do: pricing/duration_grid.py's build_candidate_grid()
+        # (wired in from app/main.py's symbol_worker() and the calibration
+        # warm-start path) is fed candidate_tick_durations and
+        # candidate_minute_durations from configs/config.yaml's
+        # contracts.rise_fall block. This switch forces one of those two
+        # lists to empty, so RiseFallSymbolPipeline.evaluate() only ever
+        # considers -- and only ever trades -- contracts in the surviving
+        # duration unit. Per-resolution calibration (astra_rise_fall_
+        # calibration_state, keyed "CALL_t"/"CALL_m"/"PUT_t"/"PUT_m") simply
+        # stops accumulating new samples for whichever resolution is turned
+        # off; its existing state is left alone, not deleted.
+        #
+        # Values (case-insensitive):
+        #   "both"   (default) -- unchanged behavior: both tick-duration and
+        #            minute-duration Rise/Fall contracts are candidates.
+        #   "minute" -- shift trading to ONLY minute-duration contracts.
+        #            candidate_tick_durations is forced to [].
+        #   "tick"   -- shift trading to ONLY tick-duration contracts.
+        #            candidate_minute_durations is forced to [].
+        # An unrecognized value falls back to "both" rather than silently
+        # trading nothing.
+        duration_mode = os.getenv("ASTRA_DURATION_MODE", "both").strip().lower()
+        if duration_mode not in ("tick", "minute", "both"):
+            duration_mode = "both"
+        self.duration_mode: str = duration_mode
+
+        self.raw["contracts"].setdefault("rise_fall", {})
+        rf_contracts = self.raw["contracts"]["rise_fall"]
+        rf_contracts.setdefault("candidate_tick_durations", [3, 5, 7, 10])
+        rf_contracts.setdefault("candidate_minute_durations", [1, 2, 3, 5, 10])
+        if self.duration_mode == "minute":
+            rf_contracts["candidate_tick_durations"] = []
+        elif self.duration_mode == "tick":
+            rf_contracts["candidate_minute_durations"] = []
+
     def __getitem__(self, key: str) -> Any:
         return self.raw[key]
 
