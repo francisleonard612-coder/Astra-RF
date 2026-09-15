@@ -44,7 +44,7 @@ contracts:
 # ceiling).
 rise_fall:
   base_stake: 0.35
-  min_edge: 0.11
+  min_edge: 0.06
   min_calibration_samples: 500
   mc_simulations: 50000
   # See decision/rise_fall_decision_engine.py's "MULTIPLE-COMPARISONS
@@ -61,7 +61,7 @@ rise_fall:
   # independently exceed min_confidence -- on top of, not instead of,
   # min_edge above. See decision/rise_fall_decision_engine.py's "CONFIDENCE
   # GATE" docstring for why both are required.
-  min_confidence: 0.8
+  min_confidence: 0.75
 
   # CALIBRATION-QUALITY GATE: found from a live deployment log where every
   # "Executing trade" line showed mc_win_probability == calibrated_
@@ -178,7 +178,7 @@ rise_fall:
   # until that report has been run and shows a real, non-flat, non-inverted
   # relationship -- see that function's own docstring for how to read it.
   conviction_shadow_only: true
-  conviction_min_voters: 4     # minimum NON-ABSTAINING layers required for a regime's mapped set to
+  conviction_min_voters: 3     # minimum NON-ABSTAINING layers required for a regime's mapped set to
                                  # count as a consensus at all -- see compute_conviction()'s own docstring
   conviction_floor: 0.25        # below this, conviction_stake() returns 0 (skip, not "trade small")
   conviction_min_mult: 0.5      # stake multiplier at conviction == conviction_floor
